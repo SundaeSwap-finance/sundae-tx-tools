@@ -287,24 +287,7 @@ function parseSignatures(signatures) {
   return result;
 }
 
-let argv = minimist(process.argv.slice(2));
-if (argv.buildUpdateFeeManager) {
-  let completed = await buildUpdateFeeManager(argv);
-  if (argv.submit) {
-    let signed = await blaze.signTransaction(completed);
-    console.log(`Signed...`);
-    let hash = await blaze.submitTransaction(completed);
-    console.log(`Submitted (${hash})...`);
-    let confirmed = await provider.awaitTransactionConfirmation(hash, 60_000);
-    if (confirmed) {
-      console.log("Confirmed");
-    } else {
-      console.log("Couldn't confirm submission");
-    }
-  } else {
-    console.log(`Please sign and submit this transaction: ${completed.toCbor()}`);
-  }
-} else if (argv.prepareUpdate) {
+function prepareUpdate(argv) {
   if (argv.updateFees) {
     let updateObject = {
       validRange: {
@@ -325,11 +308,15 @@ if (argv.buildUpdateFeeManager) {
     };
     console.log(withEncoderHex(encodeNewFeeManager, updateObject));
   }
-} else if (argv.signMessage) {
+}
+
+function signMessage(argv) {
   const signature = await ed.signAsync(argv.message, skeyHex);
   console.log("message: " + argv.message);
   console.log("signature: " + Buffer.from(signature).toString('hex'));
-} else if (argv.makeRedeemer) {
+}
+
+function makeRedeemer(argv) {
   if (argv.updateFees) {
     let updateObject = decodeNewFees(decoder(fromHex(argv.updateObject)));
     let signatures = parseSignatures(argv.signatures);
@@ -368,6 +355,35 @@ if (argv.buildUpdateFeeManager) {
       console.log("all signatures are valid");
     }
   }
+}
+
+function updateFeeManager(argv) {
+  let completed = await buildUpdateFeeManager(argv);
+  if (argv.submit) {
+    let signed = await blaze.signTransaction(completed);
+    console.log(`Signed...`);
+    let hash = await blaze.submitTransaction(completed);
+    console.log(`Submitted (${hash})...`);
+    let confirmed = await provider.awaitTransactionConfirmation(hash, 60_000);
+    if (confirmed) {
+      console.log("Confirmed");
+    } else {
+      console.log("Couldn't confirm submission");
+    }
+  } else {
+    console.log(`Please sign and submit this transaction: ${completed.toCbor()}`);
+  }
+}
+
+let argv = minimist(process.argv.slice(2));
+if (argv.buildUpdateFeeManager) {
+  await updateFeeManager(argv);
+} else if (argv.prepareUpdate) {
+  prepareUpdate(argv);
+} else if (argv.signMessage) {
+  signMessage(argv);
+} else if (argv.makeRedeemer) {
+  makeRedeemer(argv);
 }
 
 process.exit(0);
