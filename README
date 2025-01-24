@@ -1,5 +1,7 @@
 ```
 $ npx tsc
+$ export SKEY_HEX=...
+$ export BLOCKFROST_PROJECT_ID=...
 $ node index.js \
   --buildUpdateFeeManager \
   --address addr_test1vqp4mmnx647vyutfwugav0yvxhl6pdkyg69x4xqzfl4vwwck92a9t \
