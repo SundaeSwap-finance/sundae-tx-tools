@@ -23,6 +23,7 @@ import {
   encoder,
   withEncoder,
   withEncoderHex,
+  encodePoolDatum,
   encodePoolSpendRedeemer,
   encodePoolManageRedeemer,
   encodeConvenienceFeeManagerRedeemer,
@@ -137,6 +138,16 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
     throw new Error("no pool datum");
   }
 
+  // Update pool datum in output
+  let poolDatumDecoded = decodePoolDatum(decoder(fromHex(poolDatum.toCore().cbor)));
+  if (args.updateFees) {
+    poolDatumDecoded.askFees = BigInt(args.askFee);
+    poolDatumDecoded.bidFees = BigInt(args.bidFee);
+  } else if (args.updateFeeManager) {
+    poolDatumDecoded.feeManager = JSON.parse(args.feeManager);
+  }
+  let newPoolDatum = PlutusData.fromCbor(HexBlob(withEncoderHex(encodePoolDatum, poolDatumDecoded)));
+
   let myChange = await findChange(address, 20_000_000n);
 
   if (!myChange) {
@@ -214,8 +225,9 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
     // index is correct).
     .addInput(myChange)
 
-    // Pay the input pool as an output, unchanged.
-    .lockAssets(poolAddress, pool.output().amount(), poolDatum as unknown as Datum)
+    // Pay the input pool as an output. The amount is unchanged, and the datum
+    // is changed according to the update.
+    .lockAssets(poolAddress, pool.output().amount(), newPoolDatum as unknown as Datum)
 
     // Managing the pool requires invoking the pool manage stake validator. The
     // redeemer tells the validator that we want to update the fee manager.
