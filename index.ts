@@ -16,9 +16,12 @@ import {
   Value,
 } from "@blaze-cardano/core";
 import { HotSingleWallet, Core, Blaze, Blockfrost } from "@blaze-cardano/sdk";
+import * as ed from "@noble/ed25519";
 import minimist from "minimist";
 import {
   decoder,
+  decodeNewFees,
+  decodeNewFeeManager,
   decodePoolDatum,
   encoder,
   withEncoder,
@@ -27,6 +30,8 @@ import {
   encodePoolSpendRedeemer,
   encodePoolManageRedeemer,
   encodeConvenienceFeeManagerRedeemer,
+  encodeNewFees,
+  encodeNewFeeManager,
 } from "./codec.js";
 import {
   fromHex,
@@ -267,6 +272,23 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
   return completed;
 }
 
+function parseSignatures(signatures) {
+  let result = [];
+  let o = JSON.parse(signatures);
+  for (let item of o) {
+    if (!item.length || item.length != 2) {
+      throw new Error(`invalid signatures object: ${signatures}`);
+    }
+    let key = fromHex(item[0]);
+    let sig = fromHex(item[1]);
+    result.push({
+      verificationKey: key,
+      signature: sig,
+    });
+  }
+  return result;
+}
+
 let argv = minimist(process.argv.slice(2));
 if (argv.buildUpdateFeeManager) {
   let completed = await buildUpdateFeeManager(argv);
@@ -283,6 +305,70 @@ if (argv.buildUpdateFeeManager) {
     }
   } else {
     console.log(`Please sign and submit this transaction: ${completed.toCbor()}`);
+  }
+} else if (argv.prepareUpdate) {
+  if (argv.updateFees) {
+    let updateObject = {
+      validRange: {
+        lowerBound: { boundType: { tag: "NegativeInfinity" }, isInclusive: true },
+        upperBound: { boundType: { tag: "PositiveInfinity" }, isInclusive: true },
+      },
+      newBidFees: BigInt(argv.newBidFees),
+      newAskFees: BigInt(argv.newAskFees),
+    };
+    console.log(withEncoderHex(encodeNewFees, updateObject));
+  } else if (argv.updateManager) {
+    let updateObject = {
+      validRange: {
+        lowerBound: { boundType: { tag: "NegativeInfinity" }, isInclusive: true },
+        upperBound: { boundType: { tag: "PositiveInfinity" }, isInclusive: true },
+      },
+      feeManager: JSON.parse(argv.feeManager),
+    };
+    console.log(withEncoderHex(encodeNewFeeManager, updateObject));
+  }
+} else if (argv.signMessage) {
+  const signature = await ed.signAsync(argv.message, skeyHex);
+  console.log("message: " + argv.message);
+  console.log("signature: " + Buffer.from(signature).toString('hex'));
+} else if (argv.makeRedeemer) {
+  if (argv.updateFees) {
+    let updateObject = decodeNewFees(decoder(fromHex(argv.updateObject)));
+    let signatures = parseSignatures(argv.signatures);
+    let redeemer = {
+      tag: "UpdateFee",
+      newFees: updateObject,
+      signatures: signatures,
+    };
+    console.log("redeemer: " + withEncoderHex(encodeConvenienceFeeManagerRedeemer, redeemer));
+    let allValid = true;
+    for (let item of signatures) {
+      const isValid = await ed.verifyAsync(item.signature, argv.updateObject, item.verificationKey);
+      if (!isValid) {
+        console.log(`invalid signature: key ${item.verificationKey}`);
+      }
+    }
+    if (allValid) {
+      console.log("all signatures are valid");
+    }
+  } else if (argv.updateManager) {
+    let updateObject = decodeNewFeeManager(decoder(fromHex(argv.updateObject)));
+    let redeemer = {
+      tag: "UpdateFeeManager",
+      newFeeManager: updateObject,
+      signatures: signatures,
+    };
+    console.log("redeemer: " + withEncoderHex(encodeConvenienceFeeManagerRedeemer, redeemer));
+    let allValid = true;
+    for (let item of signatures) {
+      const isValid = await ed.verifyAsync(item.signature, argv.updateObject, item.verificationKey);
+      if (!isValid) {
+        console.log(`invalid signature: key ${item.verificationKey}`);
+      }
+    }
+    if (allValid) {
+      console.log("all signatures are valid");
+    }
   }
 }
 
