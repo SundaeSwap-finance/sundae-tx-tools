@@ -129,7 +129,6 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
 
   let address = Core.addressFromBech32(args.address);
 
-  // "ba228444515fbefd2c8725338e49589f206c7f18a33e002b157aac3c";
   let poolIdent = args.poolIdent;
   let pool = await findPoolByIdent(poolAddress, poolIdent);
 
@@ -185,7 +184,6 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
     poolInputIndex: poolInputIndex,
   }));
 
-  // "stake_test17qyzjcwjsw8ju4tw058ejq6f08w2au0t46zaudeqkmdvsgsl0km99"
   const poolManageAddress = new Core.Address({
     type: Core.AddressType.RewardScript,
     networkId: args.mainnet ? Core.NetworkId.Mainnet : Core.NetworkId.Testnet,
