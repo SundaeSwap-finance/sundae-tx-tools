@@ -41,3 +41,30 @@ node index.js \
   --askFee 100 \
   --bidFee 100
 ```
+
+To construct an update-fees object:
+
+```
+node index.js --prepareUpdate --updateFees --newBidFees 100 --newAskFees 100
+```
+
+To sign a message with the configured key:
+
+```
+node index.js --signMessage --message d8799fd8799fd8799fd87980d87a80ffd8799fd87b80d87a80ffff18641864ff
+```
+
+To construct a redeemer from an update object and signatures ('signatures'
+object must be an array of (pubkey, signature) tuples):
+
+```
+node index.js --makeRedeemer --updateFees --updateObject d8799fd8799fd8799fd87980d87a80ffd8799fd87b80d87a80ffff18641864ff --signatures '[["6f2b757b39b783977e0306bd2751fa3db19f2f8d52d478f44a4a03efb0fa2b29","be71d864bc2c8a5435e6ec1c56c199f90e003724df981f62b71c8123e3f06f11f012f67ca2df0a08995f6383ca5b2d991908912a12f993c7c81ef19ecf4c690b"]]'
+```
+
+To perform an update of a pool using the fee manager stake validator, perform
+these steps:
+1. Use --prepareUpdate to create an object describing the desired update.
+2. Obtain ed25519 signatures for the object from all required parties (manager
+   in case of UpdateFee, owner in case of UpdateFeeManager).
+3. Use --makeRedeemer to combine the signatures and the update object. The
+   script will verify that all signatures are correct.
