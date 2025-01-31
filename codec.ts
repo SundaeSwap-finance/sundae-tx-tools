@@ -2,6 +2,13 @@ export function decoder(bytes) {
   return {
     bytes: bytes,
     ptr: 0,
+    peek: function() {
+      if (this.bytes.length <= this.ptr) {
+        throw new Error("reached end of input");
+      }
+      let b = BigInt(this.bytes[this.ptr]);
+      return b;
+    },
     readUInt8: function() {
       if (this.bytes.length <= this.ptr) {
         throw new Error("reached end of input");
@@ -174,6 +181,26 @@ function decodeMultisig(d) {
     return {
       tag: "Signature",
       keyHash,
+    };
+  } else if (t == 124) {
+    decodeBeginIndefiniteArray(d);
+    let required = decodeInteger(d);
+    decodeBeginIndefiniteArray(d);
+    let scripts = [];
+    while (true) {
+      let b = d.peek();
+      if (b == 0xff) {
+        break;
+      }
+      let script = decodeMultisig(d);
+      scripts.push(script);
+    }
+    decodeBreak(d);
+    decodeBreak(d);
+    return {
+      tag: "AtLeast",
+      required,
+      scripts,
     };
   } else if (t == 127) {
     decodeBeginIndefiniteArray(d);
@@ -420,7 +447,9 @@ export function encodePoolManageRedeemer(e, poolManageRedeemer) {
   if (poolManageRedeemer.tag == "WithdrawFees") {
     encodeTag8(e, 121);
     encodeBeginArrayIndefinite(e);
-    throw new Error("encode WithdrawFees: todo");
+    encodeInteger(e, poolManageRedeemer.amount);
+    encodeInteger(e, poolManageRedeemer.treasuryOutput);
+    encodeInteger(e, poolManageRedeemer.poolInput);
     encodeBreak(e);
   } else if (poolManageRedeemer.tag == "UpdatePoolFees") {
     encodeTag8(e, 122);
@@ -501,12 +530,14 @@ function encodeMultisig(e, multisig) {
       encodeMultisig(e, script);
     }
     encodeBreak(e);
+    encodeBreak(e);
   } else if (multisig.tag == "AnyOf") {
     encodeTag8(e, 123);
     encodeBeginArrayIndefinite(e);
     for (let script of multisig.scripts) {
       encodeMultisig(e, script);
     }
+    encodeBreak(e);
     encodeBreak(e);
   } else if (multisig.tag == "AtLeast") {
     encodeTag8(e, 124);
@@ -515,6 +546,7 @@ function encodeMultisig(e, multisig) {
     for (let script of multisig.scripts) {
       encodeMultisig(e, script);
     }
+    encodeBreak(e);
     encodeBreak(e);
   } else if (multisig.tag == "Before") {
     encodeTag8(e, 125);
