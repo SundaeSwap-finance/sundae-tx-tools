@@ -10,7 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@blaze-cardano/sdk": "^0.2.19",
+    "@blaze-cardano/sdk": "^0.2.29",
     "minimist": "^1.2.8",
     "rxjs": "^7.8.1"
   },

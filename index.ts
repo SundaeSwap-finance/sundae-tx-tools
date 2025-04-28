@@ -627,6 +627,58 @@ function comparePoolTVL(a, b) {
   }
 }
 
+async function registerStakeAddress(argv) {
+  let address = Core.addressFromBech32(argv.address);
+
+  const cred = {
+    type: Core.CredentialType.ScriptHash,
+    hash: argv.stakeAddrHash,
+  };
+  const stakeAddress = new Core.Address({
+    type: Core.AddressType.RewardScript,
+    networkId: network,
+    // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
+    paymentPart: cred,
+  });
+
+  let change = await findChange(address, 20_000_000n);
+  let inputs = [change];
+
+  let tx = await blaze
+    .newTransaction()
+
+    // Spend pre-selected change.
+    .addInput(change)
+
+    .setMinimumFee(289741n)
+
+    .addRegisterStake(new Core.Credential(cred))
+
+    //.useCoinSelector((inputs, dearth) => {
+    //  return {
+    //    selectedInputs: [],
+    //    selectedValue: new Value(0n),
+    //    inputs: [],
+    //  }
+    //});
+
+  let completed = await tx.complete();
+  if (argv.submit) {
+    let signed = await blaze.signTransaction(completed);
+    console.log(`Signed...`);
+    let hash = await blaze.submitTransaction(completed);
+    console.log(`Submitted (${hash})...`);
+    let confirmed = await provider.awaitTransactionConfirmation(hash, 60_000);
+    if (confirmed) {
+      console.log("Confirmed");
+    } else {
+      console.log("Couldn't confirm submission");
+    }
+  } else {
+    console.log(`Please sign and submit this transaction: ${completed.toCbor()}`);
+  }
+}
+
 async function updateAllPoolStakeCredentials(argv) {
   let address = Core.addressFromBech32(argv.address);
   let knownPools = await provider.getUnspentOutputs(Core.addressFromBech32(argv.poolAddress));
@@ -699,6 +751,8 @@ if (argv.buildUpdateFeeManager) {
   await updateAllPoolStakeCredentials(argv);
 } else if (argv.updateSinglePoolStakeCredential) {
   await updateSinglePoolStakeCredential(argv);
+} else if (argv.registerStakeAddress) {
+  await registerStakeAddress(argv);
 }
 
 process.exit(0);
