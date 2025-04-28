@@ -632,46 +632,87 @@ function comparePoolTVL(a, b) {
 async function debugConditionedScoop(argv) {
   let myAddr = Core.Address.fromBech32("addr_test1vqp4mmnx647vyutfwugav0yvxhl6pdkyg69x4xqzfl4vwwck92a9t");
   let poolAddr = Core.Address.fromBech32("addr_test1xzly6g2kvwgfhdvntwfrct0kz9erfqyntw68yt2lz54kg6kvy7vq4p2hl6wm9jdvpgn80ax3xpkm7yrgnxphtrct3klqnkjjzt");
-  let change1 = new Core.TransactionUnspentOutput(
+  let scriptRefAddr = Core.Address.fromBech32("addr_test1wza7ec20249sqg87yu2aqkqp735qa02q6yd93u28gzul93gvc4wuw");
+  let poolScriptBytes = fs.readFileSync("poolScript", "utf8");
+  let poolScript = Script.newPlutusV3Script(new PlutusV3Script(poolScriptBytes));
+  let genesisOutputs = [];
+  let emulator = new Emulator(genesisOutputs);
+
+  let change1Input =
     new Core.TransactionInput(
-      Core.TransactionId("00".repeat(32)),
+      Core.TransactionId("75f9bbb87bea926c8a6b4c8d8aed84b0f0d1b4fb307da4a2b60816af2587009e"),
       0n
-    ),
+    );
+  let change1InputOutput =
     new Core.TransactionOutput(
       myAddr,
       new Core.Value(
-        100_000_000n,
+        8_934_871_210n
       ),
-    )
   );
-  let genesisOutputs = [change1.output()];
-  let emulator = new Emulator(genesisOutputs);
-
-  emulator.addUtxo(
+  let change1 = 
     new Core.TransactionUnspentOutput(
-      new Core.TransactionInput(
-        Core.TransactionId("4135f635b4f26859231c696699593781e04ffb8eef4576c9917694dcad61693b"),
-        0n
+      change1Input,
+      change1InputOutput
+    );
+
+  let poolScriptReferenceInput =
+    new Core.TransactionInput(
+      Core.TransactionId("45394d375379204a64d3fd6987afa83d1dd0c4f14a36094056f136bc21ed07b5"),
+      0n
+    );
+  let poolScriptReferenceInputOutput =
+    new Core.TransactionOutput(
+      scriptRefAddr,
+      new Core.Value(
+        57_120_430n
       ),
-      new Core.TransactionOutput(
-        poolAddr,
-        new Core.Value(
-          13_000_000n,
-          new Map([
-            ["99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15524245525259", 100000],
-            ["be4d215663909bb5935b923c2df611723480935bb4722d5f152b646a000de140a4745a3d72cd31eba160563dbaa3538b574b21cb4a08aef57e18f457", 1],
-          ])
-        ),
-      )
-    )
-  );
+    );
+  poolScriptReferenceInputOutput.setScriptRef(poolScript);
+  let poolScriptReference =
+    new Core.TransactionUnspentOutput(
+      poolScriptReferenceInput,
+      poolScriptReferenceInputOutput
+    );
+
+  let poolInput =
+    new Core.TransactionInput(
+      Core.TransactionId("4135f635b4f26859231c696699593781e04ffb8eef4576c9917694dcad61693b"),
+      0n
+    );
+
+  let poolInputOutput =
+    new Core.TransactionOutput(
+      poolAddr,
+      new Core.Value(
+        13_000_000n,
+        new Map([
+          ["99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15524245525259", 100000n],
+          ["be4d215663909bb5935b923c2df611723480935bb4722d5f152b646a000de140a4745a3d72cd31eba160563dbaa3538b574b21cb4a08aef57e18f457", 1n],
+        ])
+      ),
+    );
+  let poolInputDatum = "d8799f581ca4745a3d72cd31eba160563dbaa3538b574b21cb4a08aef57e18f4579f9f4040ff9f581c99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e1546524245525259ffff1a000f42400a0ad87a80001a002dc6c0d8799f581c60c5ca218d3fa6ba7ecf4697a7a566ead9feb87068fc1229eddcf287ffd8799fd8799fa1581c99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15a1465342455252591903e8d87980ffffff";
+  poolInputOutput.setDatum(new Core.Datum(null, PlutusData.fromCbor(poolInputDatum)));
+
+  let pool = 
+    new Core.TransactionUnspentOutput(
+      poolInput,
+      poolInputOutput
+    );
+
+  emulator.addUtxo(change1);
+  emulator.addUtxo(pool);
+  emulator.addUtxo(poolScriptReference);
 
   // a wallet with a null provider can still sign but other operations will fail
   // in lucid, emulator implemented the provider interface...
   let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, null);
   console.log(`emulator: initialized`);
   let tx = new TxBuilder(emulator.params)
+    .addInput(pool)
     .addInput(change1)
+    .addReferenceInput(poolScriptReference)
     .setChangeAddress(myAddr)
     .setNetworkId(network);
   let completed = await tx.complete();
