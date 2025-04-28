@@ -631,6 +631,7 @@ function comparePoolTVL(a, b) {
 
 async function debugConditionedScoop(argv) {
   let myAddr = Core.Address.fromBech32("addr_test1vqp4mmnx647vyutfwugav0yvxhl6pdkyg69x4xqzfl4vwwck92a9t");
+  let poolAddr = Core.Address.fromBech32("addr_test1xzly6g2kvwgfhdvntwfrct0kz9erfqyntw68yt2lz54kg6kvy7vq4p2hl6wm9jdvpgn80ax3xpkm7yrgnxphtrct3klqnkjjzt");
   let change1 = new Core.TransactionUnspentOutput(
     new Core.TransactionInput(
       Core.TransactionId("00".repeat(32)),
@@ -645,6 +646,25 @@ async function debugConditionedScoop(argv) {
   );
   let genesisOutputs = [change1.output()];
   let emulator = new Emulator(genesisOutputs);
+
+  emulator.addUtxo(
+    new Core.TransactionUnspentOutput(
+      new Core.TransactionInput(
+        Core.TransactionId("4135f635b4f26859231c696699593781e04ffb8eef4576c9917694dcad61693b"),
+        0n
+      ),
+      new Core.TransactionOutput(
+        poolAddr,
+        new Core.Value(
+          13_000_000n,
+          new Map([
+            ["99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15524245525259", 100000],
+            ["be4d215663909bb5935b923c2df611723480935bb4722d5f152b646a000de140a4745a3d72cd31eba160563dbaa3538b574b21cb4a08aef57e18f457", 1],
+          ])
+        ),
+      )
+    )
+  );
 
   // a wallet with a null provider can still sign but other operations will fail
   // in lucid, emulator implemented the provider interface...
