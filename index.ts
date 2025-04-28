@@ -656,6 +656,25 @@ async function debugConditionedScoop(argv) {
       change1InputOutput
     );
 
+  let change2Input =
+    new Core.TransactionInput(
+      Core.TransactionId("75f9bbb87bea926c8a6b4c8d8aed84b0f0d1b4fb307da4a2b60816af2587009e"),
+      1n
+    );
+  let change2InputOutput =
+    new Core.TransactionOutput(
+      myAddr,
+      new Core.Value(
+        8_934_871_210n
+      ),
+  );
+  let change2 = 
+    new Core.TransactionUnspentOutput(
+      change2Input,
+      change2InputOutput
+    );
+
+
   let poolScriptReferenceInput =
     new Core.TransactionInput(
       Core.TransactionId("45394d375379204a64d3fd6987afa83d1dd0c4f14a36094056f136bc21ed07b5"),
@@ -705,13 +724,19 @@ async function debugConditionedScoop(argv) {
   emulator.addUtxo(pool);
   emulator.addUtxo(poolScriptReference);
 
+  let poolScoopRedeemer = PlutusData.fromCbor("d87a9fd8799f00009f9f01d87a8000ffffffff");
+
   // a wallet with a null provider can still sign but other operations will fail
-  // in lucid, emulator implemented the provider interface...
+  //
+  // in lucid, emulator implemented the provider interface. but apparently not
+  // in blaze
   let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, null);
   console.log(`emulator: initialized`);
   let tx = new TxBuilder(emulator.params)
-    .addInput(pool)
+    .addInput(pool, poolScoopRedeemer)
     .addInput(change1)
+    .provideCollateral([change2])
+    .useEvaluator(emulator.evaluator)
     .addReferenceInput(poolScriptReference)
     .setChangeAddress(myAddr)
     .setNetworkId(network);
