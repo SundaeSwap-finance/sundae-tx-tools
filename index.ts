@@ -16,6 +16,8 @@ import {
   Value,
 } from "@blaze-cardano/core";
 import { HotSingleWallet, Core, Blaze, Blockfrost } from "@blaze-cardano/sdk";
+import { TxBuilder } from "@blaze-cardano/tx";
+import { Emulator } from "@blaze-cardano/emulator";
 import * as ed from "@noble/ed25519";
 import minimist from "minimist";
 import {
@@ -627,6 +629,45 @@ function comparePoolTVL(a, b) {
   }
 }
 
+async function debugConditionedScoop(argv) {
+  let myAddr = Core.Address.fromBech32("addr_test1vqp4mmnx647vyutfwugav0yvxhl6pdkyg69x4xqzfl4vwwck92a9t");
+  let change1 = new Core.TransactionUnspentOutput(
+    new Core.TransactionInput(
+      Core.TransactionId("00".repeat(32)),
+      0n
+    ),
+    new Core.TransactionOutput(
+      myAddr,
+      new Core.Value(
+        100_000_000n,
+      ),
+    )
+  );
+  let genesisOutputs = [change1.output()];
+  let emulator = new Emulator(genesisOutputs);
+
+  // a wallet with a null provider can still sign but other operations will fail
+  // in lucid, emulator implemented the provider interface...
+  let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, null);
+  console.log(`emulator: initialized`);
+  let tx = new TxBuilder(emulator.params)
+    .addInput(change1)
+    .setChangeAddress(myAddr)
+    .setNetworkId(network);
+  let completed = await tx.complete();
+
+  // HotSingleWallet.signTransaction doesn't mutate the tx, it returns a witness
+  // set containing exactly one signature. you have to write it into the tx
+  // yourself
+  let signature = await myWallet.signTransaction(completed);
+  completed.setWitnessSet(signature);
+
+  console.log(`emulator: built tx: ${completed.toCbor()}`);
+
+  let txid = await emulator.submitTransaction(completed);
+  console.log(`emulator: submitted tx: ${txid}`);
+}
+
 async function registerStakeAddress(argv) {
   let address = Core.addressFromBech32(argv.address);
 
@@ -644,7 +685,7 @@ async function registerStakeAddress(argv) {
   let change = await findChange(address, 20_000_000n);
   let inputs = [change];
 
-  let tx = await blaze
+  let tx = blaze
     .newTransaction()
 
     // Spend pre-selected change.
@@ -753,6 +794,8 @@ if (argv.buildUpdateFeeManager) {
   await updateSinglePoolStakeCredential(argv);
 } else if (argv.registerStakeAddress) {
   await registerStakeAddress(argv);
+} else if (argv.debugConditionedScoop) {
+  await debugConditionedScoop(argv);
 }
 
 process.exit(0);
