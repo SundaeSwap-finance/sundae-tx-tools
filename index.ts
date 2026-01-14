@@ -3,6 +3,7 @@ import * as readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import {
   Datum,
+  DatumKind,
   Ed25519PrivateNormalKeyHex,
   Hash32ByteBase16,
   HexBlob,
@@ -70,6 +71,20 @@ if (process.env["MAINNET"]) {
 }
 const wallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, provider);
 const blaze = await Blaze.from(provider, wallet);
+
+function hexEncode(s) {
+  return Buffer.from(s, "utf8").toString("hex");
+}
+
+async function findSettings(provider: Provider, settingsAddress: string, settingsPolicyId: string): Promise<UTxO> {
+  let settingsUtxos = await provider.getUnspentOutputs(settingsAddress);
+  for (let settingsUtxo of settingsUtxos) {
+    if (settingsUtxo.output().amount().multiasset().get(settingsPolicyId + hexEncode("settings")) == 1n) {
+      return settingsUtxo;
+    }
+  }
+  throw new Error("findSettings: Couldn't find a UTxO with the settings NFT at the settings address.");
+}
 
 async function findPoolByIdent(poolAddress: Core.Address, poolIdent: string): Promise<Core.TransactionUnspentOutput | null> {
   let pool = null;
@@ -463,7 +478,10 @@ async function updatePoolStakeCredential(args, pool, change) {
       )
     );
   }
-  let references = await provider.resolveUnspentOutputs(referenceRefs);
+  let references = [];
+  if (referenceRefs.length > 0) {
+    references = await provider.resolveUnspentOutputs(referenceRefs);
+  }
 
   let inputs = [change, pool];
   inputs.sort(compareUtxo);
@@ -650,7 +668,7 @@ async function debugConditionedScoop(argv) {
         8_934_871_210n
       ),
   );
-  let change1 = 
+  let change1 =
     new Core.TransactionUnspentOutput(
       change1Input,
       change1InputOutput
@@ -668,7 +686,7 @@ async function debugConditionedScoop(argv) {
         8_934_871_210n
       ),
   );
-  let change2 = 
+  let change2 =
     new Core.TransactionUnspentOutput(
       change2Input,
       change2InputOutput
@@ -714,7 +732,7 @@ async function debugConditionedScoop(argv) {
   let poolInputDatum = "d8799f581ca4745a3d72cd31eba160563dbaa3538b574b21cb4a08aef57e18f4579f9f4040ff9f581c99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e1546524245525259ffff1a000f42400a0ad87a80001a002dc6c0d8799f581c60c5ca218d3fa6ba7ecf4697a7a566ead9feb87068fc1229eddcf287ffd8799fd8799fa1581c99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15a1465342455252591903e8d87980ffffff";
   poolInputOutput.setDatum(new Core.Datum(null, PlutusData.fromCbor(poolInputDatum)));
 
-  let pool = 
+  let pool =
     new Core.TransactionUnspentOutput(
       poolInput,
       poolInputOutput
@@ -865,6 +883,243 @@ async function updateAllPoolStakeCredentials(argv) {
   }
 }
 
+async function buildWithdrawPoolRewards(options) {
+  let targetPoolDatum = options.targetPool.output().datum();
+  if (targetPoolDatum.kind() != DatumKind.InlineData) {
+    throw new Error(`Missing inline datum on target pool (datum kind is ${targetPoolDatum.datumKind})`);
+  }
+  let datumCbor = targetPoolDatum.asInlineData().toCbor();
+  console.log(`pool datum: ${datumCbor}`);
+  let newPoolDatum = decodePoolDatum(decoder(fromHex(datumCbor)));
+  let withdrawnAmount;
+  if (options.withdrawnAmount != undefined) {
+    withdrawnAmount = BigInt(options.withdrawnAmount);
+    newPoolDatum.protocolFees = newPoolDatum.protocolFees - withdrawnAmount;
+  } else if (options.remainingAmount != undefined) {
+    let remainingPoolFees = BigInt(options.remainingAmount);
+    withdrawnAmount = newPoolDatum.protocolFees - remainingPoolFees;
+    newPoolDatum.protocolFees = remainingPoolFees;
+  } else {
+    throw new Error("must pass either withdrawnAmount or remainingAmount");
+  }
+
+  let toSpend = [];
+  toSpend.push(options.change);
+  toSpend.push(options.targetPool);
+  toSpend.sort((a, b) => a.input().transactionId() == b.input().transactionId() ? a.input().index() - b.input().index() : (a.input().transactionId() < b.input().transactionId() ? -1 : 1));
+  let poolInputIndex = 0n;
+  for (let e of toSpend) {
+    if (e.output().address() == options.targetPool.output().address()) {
+      break;
+    }
+    poolInputIndex = poolInputIndex + 1n;
+  }
+  console.log("toSpend: ");
+  console.log(toSpend);
+
+  let treasuryAmount = 1_000_000n;
+  let withheld = withdrawnAmount - treasuryAmount;
+
+  const poolManageRedeemer = HexBlob(withEncoderHex(encodePoolManageRedeemer, {
+    tag: "WithdrawFees",
+    amount: withdrawnAmount,
+    treasuryOutput: 1n,
+    poolInput: poolInputIndex,
+  }));
+
+  let poolSpendRedeemer = HexBlob(withEncoderHex(encodePoolSpendRedeemer, {
+    tag: "Manage",
+  }));
+  console.log(`poolSpendRedeemer: ${poolSpendRedeemer}`);
+
+  let updatedPoolDatum = PlutusData.fromCbor(HexBlob(withEncoderHex(encodePoolDatum, newPoolDatum)));
+
+  const poolManageAddress = new Core.Address({
+    type: Core.AddressType.RewardScript,
+    networkId: network,
+    // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: options.blueprint.poolManage.hash,
+    },
+  });
+
+  const tx = blaze
+    .newTransaction()
+    .addInput(options.change)
+    .addInput(options.targetPool, PlutusData.fromCbor(poolSpendRedeemer));
+
+  for (let ref of options.references) {
+    tx.addReferenceInput(ref);
+  }
+  tx.addReferenceInput(options.settings);
+
+  for (let s of options.signers.split(",")) {
+    tx.addRequiredSigner(s);
+  }
+
+  tx.addWithdrawal(
+    poolManageAddress.toBech32() as Core.RewardAccount,
+    BigInt(0),
+    PlutusData.fromCbor(poolManageRedeemer)
+  );
+
+  let newPoolValue = options.targetPool.output().amount();
+  newPoolValue.setCoin(newPoolValue.coin() - withdrawnAmount);
+
+  tx.lockAssets(
+    options.targetPool.output().address(),
+    newPoolValue,
+    updatedPoolDatum
+  );
+
+  let treasuryDatum = PlutusData.fromCbor(HexBlob("d87980"));
+  tx.lockAssets(
+    options.treasuryAddress,
+    new Value(treasuryAmount),
+    treasuryDatum
+  );
+
+  if (withheld != 0n) {
+    tx.payAssets(
+      options.withheldAddress,
+      new Value(withheld)
+    );
+  }
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+    }
+  });
+
+
+  tx.provideCollateral([options.change]);
+
+  let poolManageScript = Script.newPlutusV2Script(
+    new PlutusV2Script(HexBlob(options.blueprint.poolManage.validator))
+  );
+  tx.provideScript(poolManageScript);
+
+  console.log(`tx (not completed): ${tx.toCbor()}`);
+  let completed = await tx.complete();
+  return completed;
+}
+
+async function queryPools(poolAddress, needed) {
+  let poolUtxos = await provider.getUnspentOutputs(Core.addressFromBech32(poolAddress));
+  let pools = [];
+  for (let poolUtxo of poolUtxos) {
+    try {
+      let poolDatum = getPoolDatum(poolUtxo);
+      if (poolDatum) {
+        if (poolDatum.circulatingLp != 0n) {
+          pools.push({
+            utxo: poolUtxo,
+            txHash: poolUtxo.input().transactionId(),
+            protocolFees: poolDatum.protocolFees,
+            ident: poolDatum.identifier,
+          });
+        }
+      }
+    } catch (e) {
+      console.log(`queryPools: ${e}`);
+    }
+  }
+  pools.sort((poolA, poolB) => poolA.protocolFees - poolB.protocolFees > 0 ? -1 : 1);
+  let sum = 0n;
+  let count = 0;
+  let todo = [];
+  for (let pool of pools) {
+    let canWithdraw = pool.protocolFees - 3_000_000n;
+    if (canWithdraw <= needed - sum) {
+      todo.push({
+        pool: pool,
+        amount: canWithdraw,
+        partial: false,
+      });
+      sum += canWithdraw;
+      count++;
+    } else {
+      todo.push({
+        pool: pool,
+        amount: needed - sum,
+        partial: true,
+      });
+      sum = needed;
+      count++;
+    }
+    if (sum >= needed) {
+      break;
+    }
+  }
+  if (sum < needed) {
+    throw new Error(`couldn't reach target with available pool funds; only ${sum} is available to withdraw`);
+  }
+  return todo;
+}
+
+async function autoWithdrawRewards(argv) {
+  // 1. 'queryPools': Compute optimal set of pools to withdraw from:
+  //   a. Query all withdrawable pools
+  //   b. Sort by amount of withdrawable funds
+  //   c. Select prefix that satisfies needed amount of funds, call the length of this prefix N
+  // 2. 'findChangeMany': Provision N change utxos in our wallet
+  // 3. For each pool, build and submit a withdrawal TX using the `i`th change utxo (disabling automatic change selection), retrying if the submission fails due to scooper contention (usually at least one of the withdrawals needs to be retried in practice).
+  let todo = await queryPools(argv.poolAddress, BigInt(argv.needed));
+  console.log(todo);
+
+  let change = await findChangeMany(Core.addressFromBech32(argv.walletAddress), 2_000_000n, BigInt(todo.length));
+  for (let c of change) {
+    console.log({
+      hash: c.input().transactionId(),
+      index: c.input().index(),
+    });
+  }
+
+  const settings = await findSettings(provider, Core.Address.fromBech32(argv.settingsAddress), argv.settingsScriptHash);
+  console.log(settings.output().datum().toCbor());
+
+  let referenceData = fs.readFileSync(argv.references, "utf8");
+  let referenceRefs = [];
+  for (let utxoRef of JSON.parse(referenceData)) {
+    referenceRefs.push(
+      new TransactionInput(
+        TransactionId.fromHexBlob(utxoRef.txHash),
+        BigInt(utxoRef.index),
+      )
+    );
+  }
+  let references = [];
+  if (referenceRefs.length > 0) {
+    references = await provider.resolveUnspentOutputs(referenceRefs);
+  }
+
+  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
+  for (let i = 0; i < todo.length; i++) {
+    let thisChange = change[i];
+    let targetPool = todo[i].pool.utxo;
+    let options = {
+      settings: settings,
+      change: thisChange,
+      targetPool: targetPool,
+      signers: argv.signers,
+      withdrawnAmount: todo[i].amount,
+      treasuryAmount: 1_000_000n,
+      withheldAddress: Core.addressFromBech32(argv.withheldAddress),
+      references: references,
+      blueprint: bp,
+      treasuryAddress: Core.addressFromBech32(argv.treasuryAddress),
+    };
+    const result = await buildWithdrawPoolRewards(options);
+
+    // TODO: Submit with retry
+    console.log(`Please sign and submit this transaction: ${completed.toCbor()}`);
+  }
+}
+
 let argv = minimist(process.argv.slice(2));
 if (argv.buildUpdateFeeManager) {
   await updateFeeManager(argv);
@@ -882,6 +1137,10 @@ if (argv.buildUpdateFeeManager) {
   await registerStakeAddress(argv);
 } else if (argv.debugConditionedScoop) {
   await debugConditionedScoop(argv);
+} else if (argv.withdrawGenericStake) {
+  await withdrawGenericStake(argv);
+} else if (argv.autoWithdrawRewards) {
+  await autoWithdrawRewards(argv);
 }
 
 process.exit(0);

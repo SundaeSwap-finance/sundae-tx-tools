@@ -4,6 +4,7 @@ To run:
 $ npx tsc
 $ export SKEY_HEX=...
 $ export BLOCKFROST_PROJECT_ID=...
+# export MAINNET=1
 $ node index.js ...
 ```
 
@@ -68,3 +69,20 @@ these steps:
    in case of UpdateFee, owner in case of UpdateFeeManager).
 3. Use --makeRedeemer to combine the signatures and the update object. The
    script will verify that all signatures are correct.
+
+To withdraw protocol fees:
+
+```
+node index.js \
+  --autoWithdrawRewards \
+  --poolAddress addr1x8srqftqemf0mjlukfszd97ljuxdp44r372txfcr75wrz26rnxqnmtv3hdu2t6chcfhl2zzjh36a87nmd6dwsu3jenqsslnz7e \
+  --needed 10000000 \
+  --walletAddress addr1v92m7sgckq0pc72xgldexa0lepe7gdwhxuq8k2kmcjxdh2skxa0m4 \
+  --settingsAddress addr1w9ke67k2ckdyg60v22ajqugxze79e0ax3yqgl7nway4vc5q84hpqs \
+  --settingsScriptHash 6d9d7acac59a4469ec52bb207106167c5cbfa689008ffa6ee92acc50 \
+  --references references-mainnet \
+  --signers 55bf4118b01e1c794647db9375ffc873e435d737007b2adbc48cdbaa \
+  --withheldAddress addr1v92m7sgckq0pc72xgldexa0lepe7gdwhxuq8k2kmcjxdh2skxa0m4 \
+  --blueprint mainnet.blueprint.json \
+  --treasuryAddress addr1w8qd02ncr520yph37erg7z3dfyv8684uhr6eckwht5xz0fc6vn2tg
+```
