@@ -157,8 +157,7 @@ function decodeInteger(d) {
     let x = d.readUInt8();
     let y = d.readUInt8();
     let z = d.readUInt8(); 
-    return 
-      s * BigInt(0x100000000000000) +
+    return s * BigInt(0x100000000000000) +
       t * BigInt(0x1000000000000) +
       u * BigInt(0x10000000000) +
       v * BigInt(0x100000000) +
@@ -166,7 +165,7 @@ function decodeInteger(d) {
       x * BigInt(0x10000) +
       y * BigInt(0x100) +
       z;
-    throw new Error("decodeInteger: todo");
+    //throw new Error("decodeInteger: todo");
   } else {
     throw new Error("decodeInteger: not an integer: " + sz);
   }
@@ -244,6 +243,9 @@ export function decodePoolDatum(d) {
   let marketOpen = decodeInteger(d);
   let protocolFees = decodeInteger(d);
   decodeBreak(d);
+  console.log(`circulatingLp: ${stringify(circulatingLp)}`);
+  console.log(`bidFees: ${stringify(bidFees)}`);
+  console.log(`askFees: ${stringify(askFees)}`);
   return {
     identifier,
     assetPair,
@@ -253,6 +255,150 @@ export function decodePoolDatum(d) {
     feeManager,
     marketOpen,
     protocolFees,
+  };
+}
+
+export function decodeSettingsDatum(d) {
+  let _ = decodeTag(d);
+  decodeBeginIndefiniteArray(d);
+  let settingsAdmin = decodeMultisig(d);
+  let metadataAdmin = decodeAddress(d);
+  let treasuryAdmin = decodeMultisig(d);
+  let treasuryAddress = decodeAddress(d);
+  let treasuryAllowance = decodeRational(d);
+  let authorizedScoopers = decodeOptional((d) => decodeArray(decodeByteArray, d), d);
+  let authorizedStakingKeys = decodeArray(decodeCredential, d);
+  let baseFee = decodeInteger(d);
+  let simpleFee = decodeInteger(d);
+  let strategyFee = decodeInteger(d);
+  let poolCreationFee = decodeInteger(d);
+  // We don't care about the extensions; we could just skip it but it's actually
+  // kind of annoying to implement a "skip the next CBOR item" function to
+  // handle the extensions. Fortunately we can just return immediately since
+  // this is the last item in the datum
+  //let extensions = decodeData(d);
+  //decodeBreak(d);
+  return {
+    settingsAdmin,
+    metadataAdmin,
+    treasuryAdmin,
+    treasuryAddress,
+    treasuryAllowance,
+    authorizedScoopers,
+    authorizedStakingKeys,
+    baseFee,
+    simpleFee,
+    strategyFee,
+    poolCreationFee,
+    //extensions,
+  };
+}
+
+function decodeOptional(item, d) {
+  let tag = decodeTag(d);
+  if (tag == 121) {
+    decodeBeginIndefiniteArray(d);
+    let result = item(d);
+    decodeBreak(d);
+    return {
+      some: result,
+    };
+  } else if (tag == 122) {
+    decodeEmptyArray(d);
+    return {};
+  } else {
+    throw "unexpected tag for optional: expected 121 or 122";
+  }
+}
+
+function decodeArray(item, d) {
+  decodeBeginIndefiniteArray(d);
+  let contents = [];
+  while (1) {
+    let b = d.peek();
+    if (b == 0xff) {
+      decodeBreak(d);
+      break;
+    }
+    contents.push(item(d));
+  }
+  return contents;
+}
+
+function decodeRational(d) {
+  decodeBeginIndefiniteArray(d);
+  let numerator = decodeInteger(d);
+  let denominator = decodeInteger(d);
+  decodeBreak(d);
+  return {
+    numerator,
+    denominator,
+  };
+}
+
+export function decodeCredential(d) {
+  let tag = decodeTag(d);
+  let cred;
+  if (tag == 121) {
+    decodeBeginIndefiniteArray(d);
+    cred = decodeByteArray(d);
+    decodeBreak(d);
+  } else if (tag == 122) {
+    decodeBeginIndefiniteArray(d);
+    cred = decodeByteArray(d);
+    decodeBreak(d);
+  } else {
+    throw "unexpected tag for credential: expected 121 or 122";
+  }
+  return {
+    tag,
+    cred,
+  };
+}
+
+function decodeAddress(d) {
+  let _ = decodeTag(d);
+  decodeBeginIndefiniteArray(d);
+  
+  let paymentTag = decodeTag(d);
+  let isPayment;
+  if (paymentTag == 121) {
+    isPayment = true;
+  } else if (paymentTag == 122) {
+    isPayment = false;
+  } else {
+    throw "unexpected tag for payment cred";
+  }
+  decodeBeginIndefiniteArray(d);
+  let paymentCred = decodeByteArray(d);
+  decodeBreak(d);
+  
+  let stakingTag = decodeTag(d);
+  if (stakingTag == 122) {
+    decodeEmptyArray(d);
+  } else {
+    throw "todo: unimplemented: decodeAddress: staking credential";
+  }
+  
+  decodeBreak(d);
+
+  return {
+    bech32: function(network) {
+      if (network == NetworkId.Mainnet) {
+        if (isPayment) {
+          return "61" + this.paymentCred.toString("hex");
+        } else {
+          return "71" + this.paymentCred.toString("hex");
+        }
+      } else {
+        if (isPayment) {
+          return "60" + this.paymentCred.toString("hex");
+        } else {
+          return "70" + this.paymentCred.toString("hex");
+        }
+      }
+    },
+    paymentCred,
   };
 }
 
@@ -370,8 +516,9 @@ export function encoder() {
 }
 
 function encodeInteger(e, n) {
-  if (typeof(n) != "bigint") {
-    throw new Error("encodeInteger: expected bigint");
+  let ty = typeof(n);
+  if (ty != "bigint") {
+      throw new Error(`encodeInteger: expected bigint, got ${ty}`);
   }
   if (n < 0x18) {
     e.writeUInt8(n);
@@ -380,14 +527,24 @@ function encodeInteger(e, n) {
     e.writeUInt8(n);
   } else if (n <= 0xffff) {
     e.writeUInt8(0x19);
-    e.writeUInt8(n / BigInt(256));
-    e.writeUInt8(n % BigInt(256));
+    e.writeUInt8(n / BigInt(0x100n));
+    e.writeUInt8(n % BigInt(0x100n));
   } else if (n <= 0xffffffff) {
     e.writeUInt8(0x1a);
-    e.writeUInt8(n / BigInt(16777216));
-    e.writeUInt8(n / BigInt(65536));
-    e.writeUInt8(n / BigInt(256));
-    e.writeUInt8(n % BigInt(256));
+    e.writeUInt8(n / BigInt(0x1000000n));
+    e.writeUInt8(n / BigInt(0x10000n));
+    e.writeUInt8(n / BigInt(0x100n));
+    e.writeUInt8(n % BigInt(0x100n));
+  } else if (n <= 0xffffffffffffffff) {
+    e.writeUInt8(0x1b);
+    e.writeUInt8(n / 0x100000000000000n);
+    e.writeUInt8(n / 0x1000000000000n);
+    e.writeUInt8(n / 0x10000000000n);
+    e.writeUInt8(n / 0x100000000n);
+    e.writeUInt8(n / 0x1000000n);
+    e.writeUInt8(n / 0x10000n);
+    e.writeUInt8(n / 0x100n);
+    e.writeUInt8(n % BigInt(0x100n));
   } else {
     throw new Error("encode integer: todo");
   }

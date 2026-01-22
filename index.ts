@@ -26,6 +26,7 @@ import {
   decodeNewFees,
   decodeNewFeeManager,
   decodePoolDatum,
+  decodeSettingsDatum,
   encoder,
   withEncoder,
   withEncoderHex,
@@ -180,6 +181,12 @@ function decodeBlueprint(blueprint: string): any {
   let bp: any = {};
   let o = JSON.parse(blueprint);
   for (let v of o.validators) {
+    if (v.title == "settings.spend") {
+      bp.settingsSpend = {
+        hash: v.hash,
+        validator: v.compiledCode,
+      };
+    }
     if (v.title == "pool.spend") {
       bp.poolSpend = {
         hash: v.hash,
@@ -884,13 +891,18 @@ async function updateAllPoolStakeCredentials(argv) {
 }
 
 async function buildWithdrawPoolRewards(options) {
-  let targetPoolDatum = options.targetPool.output().datum();
+  let targetPool = await findPoolByIdent(options.poolAddress, options.targetPool);
+  if (!targetPool) {
+    throw new Error(`Couldn't find pool utxo with target ident ${options.targetPool}`);
+  }
+  let targetPoolDatum = targetPool.output().datum();
   if (targetPoolDatum.kind() != DatumKind.InlineData) {
     throw new Error(`Missing inline datum on target pool (datum kind is ${targetPoolDatum.datumKind})`);
   }
   let datumCbor = targetPoolDatum.asInlineData().toCbor();
   console.log(`pool datum: ${datumCbor}`);
   let newPoolDatum = decodePoolDatum(decoder(fromHex(datumCbor)));
+  console.log(`decoded pool datum: ${stringify(newPoolDatum)}`);
   let withdrawnAmount;
   if (options.withdrawnAmount != undefined) {
     withdrawnAmount = BigInt(options.withdrawnAmount);
@@ -905,11 +917,11 @@ async function buildWithdrawPoolRewards(options) {
 
   let toSpend = [];
   toSpend.push(options.change);
-  toSpend.push(options.targetPool);
+  toSpend.push(targetPool);
   toSpend.sort((a, b) => a.input().transactionId() == b.input().transactionId() ? a.input().index() - b.input().index() : (a.input().transactionId() < b.input().transactionId() ? -1 : 1));
   let poolInputIndex = 0n;
   for (let e of toSpend) {
-    if (e.output().address() == options.targetPool.output().address()) {
+    if (e.output().address() == targetPool.output().address()) {
       break;
     }
     poolInputIndex = poolInputIndex + 1n;
@@ -917,7 +929,9 @@ async function buildWithdrawPoolRewards(options) {
   console.log("toSpend: ");
   console.log(toSpend);
 
-  let treasuryAmount = 1_000_000n;
+  // TODO: temporarily setting treasuryAmount to most of the withdrawnAmount for
+  // compat with preview, where the allowance is just 1/10
+  let treasuryAmount = 9n * withdrawnAmount / 10n + 1n;
   let withheld = withdrawnAmount - treasuryAmount;
 
   const poolManageRedeemer = HexBlob(withEncoderHex(encodePoolManageRedeemer, {
@@ -964,21 +978,30 @@ async function buildWithdrawPoolRewards(options) {
     PlutusData.fromCbor(poolManageRedeemer)
   );
 
-  let newPoolValue = options.targetPool.output().amount();
+  let newPoolValue = targetPool.output().amount();
   newPoolValue.setCoin(newPoolValue.coin() - withdrawnAmount);
 
   tx.lockAssets(
-    options.targetPool.output().address(),
+    targetPool.output().address(),
     newPoolValue,
     updatedPoolDatum
   );
 
   let treasuryDatum = PlutusData.fromCbor(HexBlob("d87980"));
-  tx.lockAssets(
-    options.treasuryAddress,
-    new Value(treasuryAmount),
-    treasuryDatum
-  );
+
+  if (options.treasuryAddress.getProps().paymentPart.type == Core.CredentialType.ScriptHash) {
+    tx.lockAssets(
+      options.treasuryAddress,
+      new Value(treasuryAmount),
+      treasuryDatum
+    );
+  } else {
+    tx.payAssets(
+      options.treasuryAddress,
+      new Value(treasuryAmount),
+      treasuryDatum
+    );
+  }
 
   if (withheld != 0n) {
     tx.payAssets(
@@ -1061,6 +1084,23 @@ async function queryPools(poolAddress, needed) {
   return todo;
 }
 
+// This takes a *builder* as an argument to allow automatic retrying in cases
+// where there is contention for one of the tx inputs.
+async function submitAndAwaitWithRetry(provider, buildTx) {
+  let confirmed = false;
+  while (!confirmed) {
+    let tx = await buildTx();
+    let hash = await provider.submitTransaction(tx);
+    console.log(`Submitted (${hash})...`);
+    confirmed = await provider.awaitTransactionConfirmation(hash, 60_000);
+    if (confirmed) {
+      console.log(`Confirmed ${hash}`);
+    } else {
+      console.log(`Couldn't confirm transaction ${hash}; retrying`);
+    }
+  }
+}
+
 async function autoWithdrawRewards(argv) {
   // 1. 'queryPools': Compute optimal set of pools to withdraw from:
   //   a. Query all withdrawable pools
@@ -1071,7 +1111,7 @@ async function autoWithdrawRewards(argv) {
   let todo = await queryPools(argv.poolAddress, BigInt(argv.needed));
   console.log(todo);
 
-  let change = await findChangeMany(Core.addressFromBech32(argv.walletAddress), 2_000_000n, BigInt(todo.length));
+  let change = await findChangeMany(Core.addressFromBech32(argv.walletAddress), 10_000_000n, BigInt(todo.length));
   for (let c of change) {
     console.log({
       hash: c.input().transactionId(),
@@ -1079,8 +1119,21 @@ async function autoWithdrawRewards(argv) {
     });
   }
 
-  const settings = await findSettings(provider, Core.Address.fromBech32(argv.settingsAddress), argv.settingsScriptHash);
-  console.log(settings.output().datum().toCbor());
+  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
+
+  const settingsAddress = new Core.Address({
+    type: Core.AddressType.EnterpriseScript,
+    networkId: network,
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: bp.settingsSpend.hash,
+    },
+  });
+
+  const settings = await findSettings(provider, settingsAddress, bp.settingsSpend.hash);
+  let settingsDatumCbor = settings.output().datum().asInlineData().toCbor();
+  console.log(settingsDatumCbor);
+  let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
 
   let referenceData = fs.readFileSync(argv.references, "utf8");
   let referenceRefs = [];
@@ -1097,26 +1150,53 @@ async function autoWithdrawRewards(argv) {
     references = await provider.resolveUnspentOutputs(referenceRefs);
   }
 
-  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
+  let totalWithdrawn = 0n;
+
+  if (argv.forceSubmit) {
+    const response = prompt("Do you really want to force submission of all transactions? (yes/no)");
+    if (response != "yes") {
+      console.log("Aborting");
+      return;
+    }
+  }
+
   for (let i = 0; i < todo.length; i++) {
     let thisChange = change[i];
     let targetPool = todo[i].pool.utxo;
     let options = {
       settings: settings,
       change: thisChange,
-      targetPool: targetPool,
+      targetPool: todo[i].pool.ident.toString("hex"),
       signers: argv.signers,
       withdrawnAmount: todo[i].amount,
       treasuryAmount: 1_000_000n,
       withheldAddress: Core.addressFromBech32(argv.withheldAddress),
       references: references,
       blueprint: bp,
-      treasuryAddress: Core.addressFromBech32(argv.treasuryAddress),
+      treasuryAddress: Core.Address.fromBytes(settingsDatum.treasuryAddress.bech32(network)),
+      poolAddress: Core.addressFromBech32(argv.poolAddress),
     };
-    const result = await buildWithdrawPoolRewards(options);
 
-    // TODO: Submit with retry
-    console.log(`Please sign and submit this transaction: ${completed.toCbor()}`);
+    if (argv.forceSubmit) {
+      await submitAndAwaitWithRetry(provider, async () => {
+        const tx = await buildWithdrawPoolRewards(options);
+        await provider.signTransaction(tx);
+        return tx;
+      });
+    } else if (argv.submit) {
+      const tx = await buildWithdrawPoolRewards(options);
+      await provider.signTransaction(tx);
+      const response = prompt("Type 'submit' to submit");
+      if (response == "submit") {
+        await signedTx.submit();
+        console.log("Submitted");
+      }
+    } else {
+      const tx = await buildWithdrawPoolRewards(options);
+      console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
+    }
+    totalWithdrawn += todo[i].amount;
+    console.log(`Total withdrawn so far: ${totalWithdrawn}`);
   }
 }
 
