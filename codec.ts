@@ -1,3 +1,11 @@
+import {
+  NetworkId,
+} from "@blaze-cardano/core";
+
+import {
+  stringify,
+} from "./util.js";
+
 export function decoder(bytes) {
   return {
     bytes: bytes,
