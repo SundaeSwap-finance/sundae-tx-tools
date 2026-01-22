@@ -19,7 +19,8 @@ import {
 } from "@blaze-cardano/core";
 import { HotSingleWallet, Core, Blaze, Blockfrost } from "@blaze-cardano/sdk";
 import { TxBuilder } from "@blaze-cardano/tx";
-import { Emulator } from "@blaze-cardano/emulator";
+import { Emulator, EmulatorProvider } from "@blaze-cardano/emulator";
+//import * as cardano_crypto from "@cardano-sdk/crypto";
 import * as ed from "@noble/ed25519";
 import minimist from "minimist";
 import {
@@ -37,6 +38,7 @@ import {
   encodeConvenienceFeeManagerRedeemer,
   encodeNewFees,
   encodeNewFeeManager,
+  encodeSettingsDatum,
 } from "./codec.js";
 import {
   fromHex,
@@ -88,7 +90,7 @@ async function findSettings(provider: Provider, settingsAddress: string, setting
   throw new Error("findSettings: Couldn't find a UTxO with the settings NFT at the settings address.");
 }
 
-async function findPoolByIdent(poolAddress: Core.Address, poolIdent: string): Promise<Core.TransactionUnspentOutput | null> {
+async function findPoolByIdent(provider: Provider, poolAddress: Core.Address, poolIdent: string): Promise<Core.TransactionUnspentOutput | null> {
   let pool = null;
   // the pool policy is the same as the spending validator hash
   let poolPolicy = poolAddress.getProps().paymentPart.hash;
@@ -211,7 +213,7 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
   let address = Core.addressFromBech32(args.address);
 
   let poolIdent = args.poolIdent;
-  let pool = await findPoolByIdent(poolAddress, poolIdent);
+  let pool = await findPoolByIdent(provider, poolAddress, poolIdent);
 
   if (!pool) {
     throw new Error("can't find pool");
@@ -663,6 +665,10 @@ function randomTxId() {
   return crypto.randomBytes(32);
 }
 
+function makeSettingsNft(settingsScriptHash) {
+  return Buffer.concat([settingsScriptHash, Buffer.from("settings", "utf8")]);
+}
+
 function makePoolNft(poolScriptHash, identifier) {
   let prefix = Buffer.from([0x00, 0xde, 0x14, 0x0a]);
   return Buffer.concat([poolScriptHash, prefix, identifier]);
@@ -671,7 +677,7 @@ function makePoolNft(poolScriptHash, identifier) {
 function makeChange(myAddress, amount) {
   let input =
     new Core.TransactionInput(
-      Core.TransactionId(randomTxId()),
+      Core.TransactionId(hexEncode(randomTxId())),
       0n
   );
 
@@ -687,23 +693,107 @@ function makeChange(myAddress, amount) {
   return utxo;
 }
 
+function multisigSignature(keyHash) {
+  return {
+    tag: "Signature",
+    keyHash,
+  };
+}
+
+function paymentAddress(keyHash) {
+  return {
+    paymentTag: 121n,
+    paymentCred: keyHash,
+  };
+  //return new Core.Address({
+  //  type: Core.AddressType.EnterpriseKey,
+  //  networkId: NetworkId.Testnet,
+  //  paymentPart: {
+  //    type: Core.CredentialType.KeyHash,
+  //    hash: keyHash,
+  //  },
+  //});
+}
+
+function makeSettings(bp, keyHash) {
+  let settingsScriptHash = Buffer.from(bp.settingsSpend.hash, "hex");
+  let settingsAddr = new Core.Address({
+    type: Core.AddressType.EnterpriseScript,
+    networkId: NetworkId.Testnet,
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: bp.settingsSpend.hash,
+    },
+  });
+
+  let settingsInput = new Core.TransactionInput(
+    Core.TransactionId(hexEncode(randomTxId())),
+    0n
+  );
+
+  let settingsInputOutput =
+    new Core.TransactionOutput(
+      settingsAddr,
+      new Core.Value(
+        10_000_000n,
+        new Map([
+          [hexEncode(makeSettingsNft(settingsScriptHash)), 1n],
+        ])
+      ),
+    );
+
+  let settingsDatum = {
+    settingsAdmin: multisigSignature(keyHash),
+    metadataAdmin: paymentAddress(keyHash),
+    treasuryAdmin: multisigSignature(keyHash),
+    treasuryAddress: paymentAddress(keyHash),
+    treasuryAllowance: { numerator: 1n, denominator: 1n },
+    authorizedScoopers: [keyHash],
+    authorizedStakingKeys: [{ tag: 121n, cred: keyHash }],
+    baseFee: 1000000n,
+    simpleFee: 1000000n,
+    strategyFee: 1000000n,
+    poolCreationFee: 1000000n,
+  };
+
+  let settingsDatumPd = PlutusData.fromCbor(HexBlob(withEncoderHex(encodeSettingsDatum, settingsDatum)));
+  settingsInputOutput.setDatum(new Core.Datum(null, settingsDatumPd));
+
+  let settings =
+    new Core.TransactionUnspentOutput(
+      settingsInput,
+      settingsInputOutput
+    );
+
+  return settings;
+}
+
 function makeRandomPool(bp, keyHash) {
   let poolScriptHash = Buffer.from(bp.poolSpend.hash, "hex");
+  let poolAddr = new Core.Address({
+    type: Core.AddressType.EnterpriseScript,
+    networkId: NetworkId.Testnet,
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: bp.poolSpend.hash,
+    },
+  });
+
   let identifier = randomIdentifier();
 
   let poolInput =
     new Core.TransactionInput(
-      Core.TransactionId(randomTxId()),
+      Core.TransactionId(hexEncode(randomTxId())),
       0n
     );
 
   let rberryPolicy = "99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15";
   let rberryToken = "524245525259";
   let sberryToken = "534245525259";
-  let assets =
+  let assetPair =
     [
-      [rberryPolicy, rberryToken],
-      [rberryPolicy, sberryToken],
+      [fromHex(rberryPolicy), fromHex(rberryToken)],
+      [fromHex(rberryPolicy), fromHex(sberryToken)],
     ];
 
   let poolInputOutput =
@@ -714,7 +804,7 @@ function makeRandomPool(bp, keyHash) {
         new Map([
           [rberryPolicy + rberryToken, 100_000_000n],
           [rberryPolicy + sberryToken, 100_000_000n],
-          [makePoolNft(poolScriptHash, identifier), 1n],
+          [hexEncode(makePoolNft(poolScriptHash, identifier)), 1n],
         ])
       ),
     );
@@ -741,51 +831,71 @@ function makeRandomPool(bp, keyHash) {
       poolInputOutput
     );
 
-  return pool;
+  return [pool, identifier];
 }
 
 async function testAutoWithdraw(argv) {
-  await Core.Cardano.crypto.ready();
   let testSkey = new Core.Ed25519PrivateKey(crypto.randomBytes(32), "Normal");
-  let testVkey = testSkey.toPublic();
-  let testPkh = testVkey.hash().hex();
+  let testVkey = await testSkey.toPublic();
+  //let testPkh = (await testVkey.hash()).hex();
+  let testPkh = await testVkey.hash();
 
-  let myAddress = Core.Address.fromBytes("60" + encodeHex(testPkh));
+  let myAddress = Core.Address.fromBytes("60" + testPkh.hex());
 
   let emulator = new Emulator([]);
 
+  let changes = [];
   for (let i = 0; i < 20; i++) {
     let change = makeChange(myAddress, 20_000_000n);
+    changes.push(change);
     emulator.addUtxo(change);
   }
   
-  let pools = [];
+  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
+  
+  let poolIds = [];
   for (let i = 0; i < 10; i++) {
-    let pool = makeRandomPool(bp, testPkh);
-    pools.push(pool);
+    let [pool, identifier] = makeRandomPool(bp, testPkh.bytes());
+    poolIds.push(identifier);
     emulator.addUtxo(pool);
   }
+
+  let poolAddress = new Core.Address({
+    type: Core.AddressType.EnterpriseScript,
+    networkId: NetworkId.Testnet,
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: bp.poolSpend.hash,
+    },
+  });
+
+  let settings = makeSettings(bp, testPkh.bytes());
+  emulator.addUtxo(settings);
 
   let settingsDatumCbor = settings.output().datum().asInlineData().toCbor();
   console.log(settingsDatumCbor);
   let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
 
   let options = {
+    provider: new EmulatorProvider(emulator),
+    poolAddress: poolAddress,
     settings: settings,
-    change: change,
-    targetPool: pools[0],
-    signers: [testPkh],
+    change: changes[0],
+    targetPool: poolIds[0].toString("hex"),
+    signers: [testPkh.hex()],
     withdrawnAmount: 1_000_000n,
     treasuryAmount: 1_000_000n,
     withheldAddress: myAddress,
-    references: references,
+    //references: references,
+    references: [],
     blueprint: bp,
     treasuryAddress: settingsDatum.treasuryAddress.bech32(network),
   };
 
-  const result = await buildWithdrawPoolRewards(options);
+  const tx = await buildWithdrawPoolRewards(options);
+  console.log(`Test tx: ${tx.toCbor()}`);
 
-  let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(testSkey.hex()), network, null);
+  //let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(testSkey.hex()), network, null);
 }
 
 async function debugConditionedScoop(argv) {
@@ -1025,7 +1135,7 @@ async function updateAllPoolStakeCredentials(argv) {
 }
 
 async function buildWithdrawPoolRewards(options) {
-  let targetPool = await findPoolByIdent(options.poolAddress, options.targetPool);
+  let targetPool = await findPoolByIdent(options.provider, options.poolAddress, options.targetPool);
   if (!targetPool) {
     throw new Error(`Couldn't find pool utxo with target ident ${options.targetPool}`);
   }
@@ -1302,6 +1412,7 @@ async function autoWithdrawRewards(argv) {
     let thisChange = change[i];
     let targetPool = todo[i].pool.utxo;
     let options = {
+      provider: provider,
       settings: settings,
       change: thisChange,
       targetPool: todo[i].pool.ident.toString("hex"),

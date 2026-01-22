@@ -116,7 +116,7 @@ function decodeByteArray(d) {
     let lower = d.readUInt8();
     return d.readBytes(upper * BigInt(256) + lower);
   } else if (b == 0x5a || b == 0x5b) {
-    throw new Error("decodeByteArray: todo"); 
+    throw new Error("decodeByteArray: todo");
   } else {
     console.log(d.state());
     throw new Error("decodeByteArray: not a byte array: " + b);
@@ -157,14 +157,14 @@ function decodeInteger(d) {
     let z = d.readUInt8();
     return w * BigInt(0x1000000) + x * BigInt(0x10000) + y * BigInt(0x100) + z;
   } else if (sz == 0x1b) {
-    let s = d.readUInt8(); 
+    let s = d.readUInt8();
     let t = d.readUInt8();
     let u = d.readUInt8();
     let v = d.readUInt8();
-    let w = d.readUInt8(); 
+    let w = d.readUInt8();
     let x = d.readUInt8();
     let y = d.readUInt8();
-    let z = d.readUInt8(); 
+    let z = d.readUInt8();
     return s * BigInt(0x100000000000000) +
       t * BigInt(0x1000000000000) +
       u * BigInt(0x10000000000) +
@@ -367,7 +367,7 @@ export function decodeCredential(d) {
 function decodeAddress(d) {
   let _ = decodeTag(d);
   decodeBeginIndefiniteArray(d);
-  
+
   let paymentTag = decodeTag(d);
   let isPayment;
   if (paymentTag == 121) {
@@ -380,14 +380,14 @@ function decodeAddress(d) {
   decodeBeginIndefiniteArray(d);
   let paymentCred = decodeByteArray(d);
   decodeBreak(d);
-  
+
   let stakingTag = decodeTag(d);
   if (stakingTag == 122) {
     decodeEmptyArray(d);
   } else {
     throw "todo: unimplemented: decodeAddress: staking credential";
   }
-  
+
   decodeBreak(d);
 
   return {
@@ -407,6 +407,7 @@ function decodeAddress(d) {
       }
     },
     paymentCred,
+    paymentTag,
   };
 }
 
@@ -678,7 +679,7 @@ function encodeByteArray(e, byteArray) {
     e.writeUInt8(byteArray.length);
     e.writeBytes(byteArray);
   } else {
-    throw new Error("encodeByteArray: todo");
+    throw new Error(`encodeByteArray: todo (length=${byteArray.length})`);
   }
 }
 
@@ -821,6 +822,79 @@ export function encodePoolDatum(e, poolDatum) {
   encodeInteger(e, poolDatum.protocolFees);
   encodeBreak(e);
 }
+
+function encodeAddress(e, address) {
+  encodeTag8(e, 121);
+  encodeBeginArrayIndefinite(e);
+
+  encodeTag8(e, address.paymentTag);
+  encodeBeginArrayIndefinite(e);
+  encodeByteArray(e, address.paymentCred);
+  encodeBreak(e);
+
+  encodeTag8(e, 122);
+  encodeEmptyArray(e);
+
+  encodeBreak(e);
+}
+
+function encodeRational(e, r) {
+  encodeBeginArrayIndefinite(e);
+  encodeInteger(e, r.numerator);
+  encodeInteger(e, r.denominator);
+  encodeBreak(e);
+}
+
+function encodeAuthorizedScoopers(e, authorizedScoopers) {
+  if (authorizedScoopers) {
+    encodeTag8(e, 121);
+    encodeBeginArrayIndefinite(e);
+    encodeBeginArrayIndefinite(e);
+    for (let bytes of authorizedScoopers) {
+      encodeByteArray(e, bytes);
+    }
+    encodeBreak(e);
+    encodeBreak(e);
+  } else {
+    encodeTag8(e, 122);
+    encodeEmptyArray(e);
+  }
+}
+
+function encodeAuthorizedStakingKeys(e, authorizedStakingKeys) {
+  encodeBeginArrayIndefinite(e);
+  for (let cred of authorizedStakingKeys) {
+    encodeCredential(e, cred);
+  }
+  encodeBreak(e);
+}
+
+export function encodeCredential(e, credential) {
+  encodeTag8(e, credential.tag);
+  encodeBeginArrayIndefinite(e);
+  encodeByteArray(e, credential.cred);
+  encodeBreak(e);
+}
+
+export function encodeSettingsDatum(e, settingsDatum) {
+  encodeTag8(e, 121);
+  encodeBeginArrayIndefinite(e);
+  encodeMultisig(e, settingsDatum.settingsAdmin);
+  encodeAddress(e, settingsDatum.metadataAdmin);
+  encodeMultisig(e, settingsDatum.treasuryAdmin);
+  encodeAddress(e, settingsDatum.treasuryAddress);
+  encodeRational(e, settingsDatum.treasuryAllowance);
+  encodeAuthorizedScoopers(e, settingsDatum.authorizedScoopers);
+  encodeAuthorizedStakingKeys(e, settingsDatum.authorizedStakingKeys);
+  encodeInteger(e, settingsDatum.baseFee);
+  encodeInteger(e, settingsDatum.simpleFee);
+  encodeInteger(e, settingsDatum.strategyFee);
+  encodeInteger(e, settingsDatum.poolCreationFee);
+  encodeTag8(e, 121);
+  encodeEmptyArray(e);
+  encodeBreak(e);
+}
+
 
 function testDecodePoolDatum() {
   let epdHex = "d8799f581cba228444515fbefd2c8725338e49589f206c7f18a33e002b157aac3c9f9f4040ff9f581c99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e1546534245525259ffff1a01c9c380181e181ed8799fd87f9f581ce8dc0595c8d3a7e2c0323a11f5519c32d3b3fb7a994519e38b698b5dffff001a002dc6c0ff";
