@@ -749,7 +749,7 @@ function makeSettings(bp, keyHash) {
     metadataAdmin: paymentAddress(keyHash),
     treasuryAdmin: multisigSignature(keyHash),
     treasuryAddress: paymentAddress(keyHash),
-    treasuryAllowance: { numerator: 1n, denominator: 1n },
+    treasuryAllowance: { numerator: 1n, denominator: 10n },
     authorizedScoopers: [keyHash],
     authorizedStakingKeys: [{ tag: 121n, cred: keyHash }],
     baseFee: 1000000n,
@@ -773,11 +773,15 @@ function makeSettings(bp, keyHash) {
 function makeRandomPool(bp, keyHash) {
   let poolScriptHash = Buffer.from(bp.poolSpend.hash, "hex");
   let poolAddr = new Core.Address({
-    type: Core.AddressType.EnterpriseScript,
+    type: Core.AddressType.BasePaymentScriptStakeKey,
     networkId: NetworkId.Testnet,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
       hash: bp.poolSpend.hash,
+    },
+    delegationPart: {
+      type: Core.CredentialType.KeyHash,
+      hash: keyHash.hex(),
     },
   });
 
@@ -821,7 +825,7 @@ function makeRandomPool(bp, keyHash) {
     askFees: 50n,
     feeManager: {
       tag: "Signature",
-      keyHash,
+      keyHash: keyHash.bytes(),
     },
     marketOpen: 0n,
     protocolFees: 20_000_000n,
@@ -887,17 +891,21 @@ async function testAutoWithdraw(argv) {
   
   let poolIds = [];
   for (let i = 0; i < 10; i++) {
-    let [pool, identifier] = makeRandomPool(bp, testPkh.bytes());
+    let [pool, identifier] = makeRandomPool(bp, testPkh);
     poolIds.push(identifier);
     emulator.addUtxo(pool);
   }
 
   let poolAddress = new Core.Address({
-    type: Core.AddressType.EnterpriseScript,
+    type: Core.AddressType.BasePaymentScriptStakeKey,
     networkId: NetworkId.Testnet,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
       hash: bp.poolSpend.hash,
+    },
+    delegationPart: {
+      type: Core.CredentialType.KeyHash,
+      hash: testPkh.hex(),
     },
   });
 
