@@ -364,17 +364,35 @@ export function decodeCredential(d) {
   };
 }
 
+export function newAddress(cred, tag) {
+  let isPayment = tag == 121;
+  return {
+    bytes: function(network) {
+      if (network == NetworkId.Mainnet) {
+        if (isPayment) {
+          return "61" + this.paymentCred.toString("hex");
+        } else {
+          return "71" + this.paymentCred.toString("hex");
+        }
+      } else {
+        if (isPayment) {
+          return "60" + this.paymentCred.toString("hex");
+        } else {
+          return "70" + this.paymentCred.toString("hex");
+        }
+      }
+    },
+    paymentCred: cred,
+    paymentTag: tag,
+  };
+}
+
 function decodeAddress(d) {
   let _ = decodeTag(d);
   decodeBeginIndefiniteArray(d);
 
   let paymentTag = decodeTag(d);
-  let isPayment;
-  if (paymentTag == 121) {
-    isPayment = true;
-  } else if (paymentTag == 122) {
-    isPayment = false;
-  } else {
+  if (paymentTag != 121 && paymentTag != 122) {
     throw "unexpected tag for payment cred";
   }
   decodeBeginIndefiniteArray(d);
@@ -390,25 +408,7 @@ function decodeAddress(d) {
 
   decodeBreak(d);
 
-  return {
-    bech32: function(network) {
-      if (network == NetworkId.Mainnet) {
-        if (isPayment) {
-          return "61" + this.paymentCred.toString("hex");
-        } else {
-          return "71" + this.paymentCred.toString("hex");
-        }
-      } else {
-        if (isPayment) {
-          return "60" + this.paymentCred.toString("hex");
-        } else {
-          return "70" + this.paymentCred.toString("hex");
-        }
-      }
-    },
-    paymentCred,
-    paymentTag,
-  };
+  return newAddress(paymentCred, paymentTag);
 }
 
 function decodeBoundType(d) {

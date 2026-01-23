@@ -39,6 +39,7 @@ import {
   encodeNewFees,
   encodeNewFeeManager,
   encodeSettingsDatum,
+  newAddress,
 } from "./codec.js";
 import {
   fromHex,
@@ -670,14 +671,16 @@ function makeSettingsNft(settingsScriptHash) {
 }
 
 function makePoolNft(poolScriptHash, identifier) {
-  let prefix = Buffer.from([0x00, 0xde, 0x14, 0x0a]);
+  let prefix = Buffer.from([0x00, 0x0d, 0xe1, 0x40]);
   return Buffer.concat([poolScriptHash, prefix, identifier]);
 }
 
 function makeChange(myAddress, amount) {
+  let txid = randomTxId();
+  txid[0] = 0x11;
   let input =
     new Core.TransactionInput(
-      Core.TransactionId(hexEncode(randomTxId())),
+      Core.TransactionId(hexEncode(txid)),
       0n
   );
 
@@ -701,10 +704,7 @@ function multisigSignature(keyHash) {
 }
 
 function paymentAddress(keyHash) {
-  return {
-    paymentTag: 121n,
-    paymentCred: keyHash,
-  };
+  return newAddress(keyHash, 121n);
   //return new Core.Address({
   //  type: Core.AddressType.EnterpriseKey,
   //  networkId: NetworkId.Testnet,
@@ -726,8 +726,10 @@ function makeSettings(bp, keyHash) {
     },
   });
 
+  let txid = randomTxId();
+  txid[0] = 0x00;
   let settingsInput = new Core.TransactionInput(
-    Core.TransactionId(hexEncode(randomTxId())),
+    Core.TransactionId(hexEncode(txid)),
     0n
   );
 
@@ -781,9 +783,12 @@ function makeRandomPool(bp, keyHash) {
 
   let identifier = randomIdentifier();
 
+  let txid = randomTxId();
+  txid[0] = 0x22;
+
   let poolInput =
     new Core.TransactionInput(
-      Core.TransactionId(hexEncode(randomTxId())),
+      Core.TransactionId(hexEncode(txid)),
       0n
     );
 
@@ -834,10 +839,37 @@ function makeRandomPool(bp, keyHash) {
   return [pool, identifier];
 }
 
+function makeScriptRef(address, validator) {
+  let txid = randomTxId();
+  txid[0] = 0xff;
+
+  let refInput =
+    new Core.TransactionInput(
+      Core.TransactionId(hexEncode(txid)),
+      0n
+    );
+
+  let refInputOutput =
+    new Core.TransactionOutput(
+      address,
+      new Core.Value(100_000_000n),
+    );
+
+    let script = Script.newPlutusV2Script(new PlutusV2Script(validator));
+    refInputOutput.setScriptRef(script);
+
+    let ref =
+      new Core.TransactionUnspentOutput(
+        refInput,
+        refInputOutput
+      );
+
+    return ref;
+}
+
 async function testAutoWithdraw(argv) {
   let testSkey = new Core.Ed25519PrivateKey(crypto.randomBytes(32), "Normal");
   let testVkey = await testSkey.toPublic();
-  //let testPkh = (await testVkey.hash()).hex();
   let testPkh = await testVkey.hash();
 
   let myAddress = Core.Address.fromBytes("60" + testPkh.hex());
@@ -873,29 +905,42 @@ async function testAutoWithdraw(argv) {
   emulator.addUtxo(settings);
 
   let settingsDatumCbor = settings.output().datum().asInlineData().toCbor();
-  console.log(settingsDatumCbor);
+  console.log(`settingsDatumCbor: ${settingsDatumCbor}`);
   let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
 
+  let treasuryAddr = settingsDatum.treasuryAddress.bytes(network);
+  console.log(`treasuryAddr: ${treasuryAddr}`);
+
+  let poolScriptRef = makeScriptRef(myAddress, bp.poolSpend.validator);
+  emulator.addUtxo(poolScriptRef);
+
+  let poolManageScriptRef = makeScriptRef(myAddress, bp.poolManage.validator);
+  emulator.addUtxo(poolManageScriptRef);
+
+  let references = [poolScriptRef, poolManageScriptRef];
+
+  let provider = new EmulatorProvider(emulator);
+  let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(testSkey.hex()), network, provider);
+  let blaze = await Blaze.from(provider, myWallet);
+
   let options = {
-    provider: new EmulatorProvider(emulator),
+    blaze: blaze,
+    provider: provider,
     poolAddress: poolAddress,
     settings: settings,
     change: changes[0],
     targetPool: poolIds[0].toString("hex"),
-    signers: [testPkh.hex()],
-    withdrawnAmount: 1_000_000n,
-    treasuryAmount: 1_000_000n,
+    signers: testPkh.hex(),
+    withdrawnAmount: 10_000_000n,
     withheldAddress: myAddress,
-    //references: references,
-    references: [],
+    references: references,
     blueprint: bp,
-    treasuryAddress: settingsDatum.treasuryAddress.bech32(network),
+    treasuryAddress: Core.Address.fromBytes(treasuryAddr),
   };
 
   const tx = await buildWithdrawPoolRewards(options);
   console.log(`Test tx: ${tx.toCbor()}`);
 
-  //let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(testSkey.hex()), network, null);
 }
 
 async function debugConditionedScoop(argv) {
@@ -1160,7 +1205,7 @@ async function buildWithdrawPoolRewards(options) {
   }
 
   let toSpend = [];
-  //toSpend.push(options.change);
+  toSpend.push(options.change);
   toSpend.push(targetPool);
   toSpend.sort((a, b) => a.input().transactionId() == b.input().transactionId() ? a.input().index() - b.input().index() : (a.input().transactionId() < b.input().transactionId() ? -1 : 1));
   let poolInputIndex = 0n;
@@ -1202,14 +1247,15 @@ async function buildWithdrawPoolRewards(options) {
     },
   });
 
-  //const tx = new TxBuilder(provider.params)
-  //  .addInput(options.change)
-  //  .addInput(targetPool, PlutusData.fromCbor(poolSpendRedeemer));
-
-  const tx = blaze
+  const tx = options.blaze
     .newTransaction()
     .addInput(options.change)
     .addInput(targetPool, PlutusData.fromCbor(poolSpendRedeemer));
+
+  //const tx = blaze
+  //  .newTransaction()
+  //  .addInput(options.change)
+  //  .addInput(targetPool, PlutusData.fromCbor(poolSpendRedeemer));
 
   for (let ref of options.references) {
     tx.addReferenceInput(ref);
@@ -1412,6 +1458,7 @@ async function autoWithdrawRewards(argv) {
     let thisChange = change[i];
     let targetPool = todo[i].pool.utxo;
     let options = {
+      blaze: blaze,
       provider: provider,
       settings: settings,
       change: thisChange,
@@ -1422,7 +1469,7 @@ async function autoWithdrawRewards(argv) {
       withheldAddress: Core.addressFromBech32(argv.withheldAddress),
       references: references,
       blueprint: bp,
-      treasuryAddress: Core.Address.fromBytes(settingsDatum.treasuryAddress.bech32(network)),
+      treasuryAddress: Core.Address.fromBytes(settingsDatum.treasuryAddress.bytes(network)),
       poolAddress: Core.addressFromBech32(argv.poolAddress),
     };
 
