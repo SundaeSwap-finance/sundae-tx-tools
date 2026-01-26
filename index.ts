@@ -3,9 +3,11 @@ import * as fs from "node:fs";
 import * as readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import {
+  Address,
   Datum,
   DatumKind,
   Ed25519PrivateNormalKeyHex,
+  Hash28ByteBase16,
   Hash32ByteBase16,
   HexBlob,
   NetworkId,
@@ -13,14 +15,15 @@ import {
   PlutusV2Script,
   PlutusV3Script,
   Script,
+  Transaction,
   TransactionId,
   TransactionInput,
   Value,
 } from "@blaze-cardano/core";
-import { HotSingleWallet, Core, Blaze, Blockfrost } from "@blaze-cardano/sdk";
+import { HotSingleWallet, Core, Blaze, Blockfrost, Provider, Wallet } from "@blaze-cardano/sdk";
 import { TxBuilder } from "@blaze-cardano/tx";
 import { Emulator, EmulatorProvider } from "@blaze-cardano/emulator";
-//import * as cardano_crypto from "@cardano-sdk/crypto";
+import { Ed25519KeyHash } from "@cardano-sdk/crypto";
 import * as ed from "@noble/ed25519";
 import minimist from "minimist";
 import {
@@ -40,6 +43,15 @@ import {
   encodeNewFeeManager,
   encodeSettingsDatum,
   newAddress,
+  MultisigSignature,
+  Address as CodecAddress,
+  NewFees,
+  NewFeeManager,
+  ConvenienceFeeManagerRedeemerUpdateFee,
+  ConvenienceFeeManagerRedeemerUpdateFeeManager,
+  PoolDatum,
+  SettingsDatum,
+  AssetPair,
 } from "./codec.js";
 import {
   fromHex,
@@ -51,7 +63,7 @@ if (!projectId) {
   throw new Error("Missing blockfrost key");
 }
 
-let provider;
+let provider: Provider;
 if (process.env["MAINNET"]) {
   provider = new Blockfrost({
     network: "cardano-mainnet",
@@ -68,7 +80,7 @@ const skeyHex = process.env["SKEY_HEX"];
 if (!skeyHex) {
   throw new Error("Missing skey");
 }
-let network;
+let network: NetworkId;
 if (process.env["MAINNET"]) {
   network = NetworkId.Mainnet;
 } else {
@@ -77,26 +89,39 @@ if (process.env["MAINNET"]) {
 const wallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, provider);
 const blaze = await Blaze.from(provider, wallet);
 
-function hexEncode(s) {
+function hexEncode(s: string): string {
   return Buffer.from(s, "utf8").toString("hex");
 }
 
-async function findSettings(provider: Provider, settingsAddress: string, settingsPolicyId: string): Promise<UTxO> {
-  let settingsUtxos = await provider.getUnspentOutputs(settingsAddress);
+function hexEncodeBuffer(b: Buffer): string {
+  return b.toString("hex");
+}
+
+async function findSettings(provider: Provider, settingsAddress: Address, settingsPolicyId: string): Promise<Core.TransactionUnspentOutput> {
+  let settingsUtxos: Core.TransactionUnspentOutput[] = await provider.getUnspentOutputs(settingsAddress);
   for (let settingsUtxo of settingsUtxos) {
-    if (settingsUtxo.output().amount().multiasset().get(settingsPolicyId + hexEncode("settings")) == 1n) {
+    let assetId = Core.AssetId(settingsPolicyId + hexEncode("settings"));
+    let ma = settingsUtxo.output().amount().multiasset();
+    if (ma == undefined) {
+      continue;
+    }
+    if (ma.get(assetId) == 1n) {
       return settingsUtxo;
     }
   }
   throw new Error("findSettings: Couldn't find a UTxO with the settings NFT at the settings address.");
 }
 
-async function findPoolByIdent(provider: Provider, poolAddress: Core.Address, poolIdent: string): Promise<Core.TransactionUnspentOutput | null> {
+async function findPoolByIdent(provider: Provider, poolAddress: Core.Address, poolIdent: string): Promise<Core.TransactionUnspentOutput> {
   let pool = null;
   // the pool policy is the same as the spending validator hash
-  let poolPolicy = poolAddress.getProps().paymentPart.hash;
+  let poolPolicy = poolAddress.getProps().paymentPart?.hash;
+  if (!poolPolicy) {
+    throw new Error("Couldn't get pool policy");
+  }
   let poolNft = poolPolicy + "000de140" + poolIdent;
-  let knownPool = await provider.getUnspentOutputByNFT(poolNft);
+  let poolNftAssetId = Core.AssetId(poolNft);
+  let knownPool = await provider.getUnspentOutputByNFT(poolNftAssetId);
   if (knownPool) {
     let datum = knownPool.output().datum();
     if (!datum) {
@@ -110,14 +135,18 @@ async function findPoolByIdent(provider: Provider, poolAddress: Core.Address, po
       pool = knownPool;
     }
   }
+  if (!pool) {
+    throw new Error(`Couldn't find pool with ident: ${poolIdent}`);
+  }
   return pool;
 }
 
-async function findChange(address: Core.Address, amount: bigint) {
-  const utxos = await provider.getUnspentOutputs(address);
+async function findChange(address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput> {
+  const utxos: Core.TransactionUnspentOutput[] = await provider.getUnspentOutputs(address);
   for (const utxo of utxos) {
     // Skip utxos with assets
-    if (utxo.output().amount().multiasset().size > 0) {
+    let ma = utxo.output().amount().multiasset();
+    if (ma != undefined && ma.size > 0) {
       continue;
     }
     // Skip utxos with scripts
@@ -132,14 +161,16 @@ async function findChange(address: Core.Address, amount: bigint) {
       return utxo;
     }
   }
+  throw new Error(`Couldn't find a change utxo with ${amount} lovelace`);
 }
 
-async function findChangeMany(address: Core.Address, amount: bigint, count: bigint) {
+async function findChangeMany(address: Core.Address, amount: bigint, count: bigint): Promise<Core.TransactionUnspentOutput[]> {
   const utxos = await provider.getUnspentOutputs(address);
   let change = [];
   for (const utxo of utxos) {
     // Skip utxos with assets
-    if (utxo.output().amount().multiasset().size > 0) {
+    let ma = utxo.output().amount().multiasset();
+    if (ma != undefined && ma.size > 0) {
       continue;
     }
     // Skip utxos with scripts
@@ -165,7 +196,7 @@ async function findChangeMany(address: Core.Address, amount: bigint, count: bigi
 
 
 
-function compareUtxo(a: any, b: any): number {
+function compareUtxo(a: Core.TransactionUnspentOutput, b: Core.TransactionUnspentOutput): number {
   if (a.input().transactionId() < b.input().transactionId()) {
     return -1;
   } else if (a.input().transactionId() > b.input().transactionId()) {
@@ -181,7 +212,18 @@ function compareUtxo(a: any, b: any): number {
   }
 }
 
-function decodeBlueprint(blueprint: string): any {
+interface BlueprintScript {
+  hash: string,
+  validator: string,
+}
+
+interface Blueprint {
+  settingsSpend: BlueprintScript,
+  poolSpend: BlueprintScript,
+  poolManage: BlueprintScript,
+}
+
+function decodeBlueprint(blueprint: string): Blueprint {
   let bp: any = {};
   let o = JSON.parse(blueprint);
   for (let v of o.validators) {
@@ -204,7 +246,7 @@ function decodeBlueprint(blueprint: string): any {
       };
     }
   }
-  return bp;
+  return bp as Blueprint;
 }
 
 async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
@@ -227,7 +269,11 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
   }
 
   // Update pool datum in output
-  let poolDatumDecoded = decodePoolDatum(decoder(fromHex(poolDatum.toCore().cbor)));
+  let pd = poolDatum.asInlineData();
+  if (!pd) {
+    throw new Error("pool datum is not inline");
+  }
+  let poolDatumDecoded = decodePoolDatum(decoder(fromHex(pd.toCbor())));
   if (args.updateFees) {
     poolDatumDecoded.askFees = BigInt(args.askFee);
     poolDatumDecoded.bidFees = BigInt(args.bidFee);
@@ -274,7 +320,7 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
     // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: bp.poolManage.hash,
+      hash: Hash28ByteBase16(bp.poolManage.hash),
     },
   });
 
@@ -339,6 +385,7 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
         selectedInputs: [],
         selectedValue: new Value(0n),
         inputs: [],
+        leftoverInputs: [],
       }
     })
 
@@ -354,7 +401,12 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
   return completed;
 }
 
-function parseSignatures(signatures) {
+interface Signature {
+  verificationKey: Buffer,
+  signature: Buffer,
+}
+
+function parseSignatures(signatures: string): Signature[] {
   let result = [];
   let o = JSON.parse(signatures);
   for (let item of o) {
@@ -371,9 +423,9 @@ function parseSignatures(signatures) {
   return result;
 }
 
-function prepareUpdate(argv) {
+function prepareUpdate(argv: any) {
   if (argv.updateFees) {
-    let updateObject = {
+    let updateObject: NewFees = {
       validRange: {
         lowerBound: { boundType: { tag: "NegativeInfinity" }, isInclusive: true },
         upperBound: { boundType: { tag: "PositiveInfinity" }, isInclusive: true },
@@ -383,7 +435,7 @@ function prepareUpdate(argv) {
     };
     console.log(withEncoderHex(encodeNewFees, updateObject));
   } else if (argv.updateManager) {
-    let updateObject = {
+    let updateObject: NewFeeManager = {
       validRange: {
         lowerBound: { boundType: { tag: "NegativeInfinity" }, isInclusive: true },
         upperBound: { boundType: { tag: "PositiveInfinity" }, isInclusive: true },
@@ -394,17 +446,21 @@ function prepareUpdate(argv) {
   }
 }
 
-async function signMessage(argv) {
-  const signature = await ed.signAsync(argv.message, skeyHex);
+async function signMessage(argv: any) {
+  let key = skeyHex;
+  if (key == undefined) {
+    throw new Error(`signing key not configured`);
+  }
+  const signature = await ed.signAsync(argv.message, key);
   console.log("message: " + argv.message);
   console.log("signature: " + Buffer.from(signature).toString('hex'));
 }
 
-async function makeRedeemer(argv) {
+async function makeRedeemer(argv: any) {
   if (argv.updateFees) {
     let updateObject = decodeNewFees(decoder(fromHex(argv.updateObject)));
     let signatures = parseSignatures(argv.signatures);
-    let redeemer = {
+    let redeemer: ConvenienceFeeManagerRedeemerUpdateFee = {
       tag: "UpdateFee",
       newFees: updateObject,
       signatures: signatures,
@@ -422,7 +478,8 @@ async function makeRedeemer(argv) {
     }
   } else if (argv.updateManager) {
     let updateObject = decodeNewFeeManager(decoder(fromHex(argv.updateObject)));
-    let redeemer = {
+    let signatures = parseSignatures(argv.signatures);
+    let redeemer: ConvenienceFeeManagerRedeemerUpdateFeeManager = {
       tag: "UpdateFeeManager",
       newFeeManager: updateObject,
       signatures: signatures,
@@ -441,7 +498,7 @@ async function makeRedeemer(argv) {
   }
 }
 
-async function updateFeeManager(argv) {
+async function updateFeeManager(argv: any) {
   let completed = await buildUpdateFeeManager(argv);
   if (argv.submit) {
     let signed = await blaze.signTransaction(completed);
@@ -459,11 +516,16 @@ async function updateFeeManager(argv) {
   }
 }
 
-async function updatePoolStakeCredential(args, pool, change) {
+async function updatePoolStakeCredential(args: any, pool: Core.TransactionUnspentOutput, change: Core.TransactionUnspentOutput) {
   let bp = decodeBlueprint(fs.readFileSync(args.blueprint, "utf8"));
   let poolAddress = pool.output().address();
 
   let address = Core.addressFromBech32(args.address);
+
+  let poolDatum = pool.output().datum()?.asInlineData();
+  if (!poolDatum) {
+    throw new Error("No pool datum");
+  }
 
   const poolManageAddress = new Core.Address({
     type: Core.AddressType.RewardScript,
@@ -471,7 +533,7 @@ async function updatePoolStakeCredential(args, pool, change) {
     // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: bp.poolManage.hash,
+      hash: Hash28ByteBase16(bp.poolManage.hash),
     },
   });
 
@@ -489,7 +551,7 @@ async function updatePoolStakeCredential(args, pool, change) {
       )
     );
   }
-  let references = [];
+  let references: Core.TransactionUnspentOutput[] = [];
   if (referenceRefs.length > 0) {
     references = await provider.resolveUnspentOutputs(referenceRefs);
   }
@@ -538,7 +600,7 @@ async function updatePoolStakeCredential(args, pool, change) {
 
     // Pay the input pool as an output. The amount is unchanged, and the datum
     // is changed according to the update.
-    .lockAssets(newPoolAddress, pool.output().amount(), pool.output().datum())
+    .lockAssets(newPoolAddress, pool.output().amount(), poolDatum)
 
     // We have to withdraw fees in order to change the stake credential. We can
     // withdraw 0 fees, but a treasury output must exist, or else the validator
@@ -561,6 +623,7 @@ async function updatePoolStakeCredential(args, pool, change) {
         selectedInputs: [],
         selectedValue: new Value(0n),
         inputs: [],
+        leftoverInputs: [],
       }
     })
 
@@ -574,15 +637,18 @@ async function updatePoolStakeCredential(args, pool, change) {
   return completed;
 }
 
-async function updateSinglePoolStakeCredential(argv) {
+async function updateSinglePoolStakeCredential(argv: any) {
   let address = Core.addressFromBech32(argv.address);
   let poolAddress = Core.addressFromBech32(argv.poolAddress);
 
   let pool = null;
   // the pool policy is the same as the spending validator hash
-  let poolPolicy = poolAddress.getProps().paymentPart.hash;
+  let poolPolicy = poolAddress.getProps().paymentPart?.hash;
+  if (!poolPolicy) {
+    throw new Error("Couldn't get pool policy");
+  }
   let poolNft = poolPolicy + "000de140" + argv.poolIdent;
-  let knownPool = await provider.getUnspentOutputByNFT(poolNft);
+  let knownPool = await provider.getUnspentOutputByNFT(Core.AssetId(poolNft));
   if (knownPool) {
     let datum = knownPool.output().datum();
     if (!datum) {
@@ -621,7 +687,7 @@ async function updateSinglePoolStakeCredential(argv) {
   }
 }
 
-function getPoolDatum(pool) {
+function getPoolDatum(pool: Core.TransactionUnspentOutput): PoolDatum | null {
   let datum = pool.output().datum();
   if (!datum) {
     return null;
@@ -636,17 +702,17 @@ function getPoolDatum(pool) {
 }
 
 // We don't really care about exotic pools with little ada because they won't contribute much to staking rewards
-function poolTVL(pool) {
+function poolTVL(pool: Core.TransactionUnspentOutput): bigint {
   return pool.output().amount().coin() * 2n;
 }
 
-function txref(utxo) {
+function txref(utxo: Core.TransactionUnspentOutput): string {
   let txid = utxo.input().transactionId();
   let txix = utxo.input().index();
   return `${txid}#${txix}`;
 }
 
-function comparePoolTVL(a, b) {
+function comparePoolTVL(a: Core.TransactionUnspentOutput, b: Core.TransactionUnspentOutput): number {
   let tvlA = poolTVL(a);
   let tvlB = poolTVL(b);
   if (tvlA > tvlB) {
@@ -658,29 +724,29 @@ function comparePoolTVL(a, b) {
   }
 }
 
-function randomIdentifier() {
+function randomIdentifier(): Buffer {
   return crypto.randomBytes(28);
 }
 
-function randomTxId() {
+function randomTxId(): Buffer {
   return crypto.randomBytes(32);
 }
 
-function makeSettingsNft(settingsScriptHash) {
+function makeSettingsNft(settingsScriptHash: Buffer): Buffer {
   return Buffer.concat([settingsScriptHash, Buffer.from("settings", "utf8")]);
 }
 
-function makePoolNft(poolScriptHash, identifier) {
+function makePoolNft(poolScriptHash: Buffer, identifier: Buffer): Buffer {
   let prefix = Buffer.from([0x00, 0x0d, 0xe1, 0x40]);
   return Buffer.concat([poolScriptHash, prefix, identifier]);
 }
 
-function makeChange(myAddress, amount) {
+function makeChange(myAddress: Address, amount: bigint): Core.TransactionUnspentOutput {
   let txid = randomTxId();
   txid[0] = 0x11;
   let input =
     new Core.TransactionInput(
-      Core.TransactionId(hexEncode(txid)),
+      Core.TransactionId(hexEncodeBuffer(txid)),
       0n
   );
 
@@ -696,40 +762,33 @@ function makeChange(myAddress, amount) {
   return utxo;
 }
 
-function multisigSignature(keyHash) {
-  return {
+function multisigSignature(keyHash: Ed25519KeyHash): MultisigSignature {
+  let buf: Buffer = Buffer.from(keyHash.bytes());
+  return ({
     tag: "Signature",
-    keyHash,
-  };
+    keyHash: buf,
+  } as MultisigSignature);
 }
 
-function paymentAddress(keyHash) {
-  return newAddress(keyHash, 121n);
-  //return new Core.Address({
-  //  type: Core.AddressType.EnterpriseKey,
-  //  networkId: NetworkId.Testnet,
-  //  paymentPart: {
-  //    type: Core.CredentialType.KeyHash,
-  //    hash: keyHash,
-  //  },
-  //});
+function paymentAddress(keyHash: Ed25519KeyHash): CodecAddress {
+  return newAddress(Buffer.from(keyHash.bytes()), 121n);
 }
 
-function makeSettings(bp, keyHash) {
+function makeSettings(bp: Blueprint, keyHash: Ed25519KeyHash): Core.TransactionUnspentOutput {
   let settingsScriptHash = Buffer.from(bp.settingsSpend.hash, "hex");
   let settingsAddr = new Core.Address({
     type: Core.AddressType.EnterpriseScript,
     networkId: NetworkId.Testnet,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: bp.settingsSpend.hash,
+      hash: Hash28ByteBase16(bp.settingsSpend.hash),
     },
   });
 
   let txid = randomTxId();
   txid[0] = 0x00;
   let settingsInput = new Core.TransactionInput(
-    Core.TransactionId(hexEncode(txid)),
+    Core.TransactionId(hexEncodeBuffer(txid)),
     0n
   );
 
@@ -739,19 +798,19 @@ function makeSettings(bp, keyHash) {
       new Core.Value(
         10_000_000n,
         new Map([
-          [hexEncode(makeSettingsNft(settingsScriptHash)), 1n],
+          [Core.AssetId(hexEncodeBuffer(makeSettingsNft(settingsScriptHash))), 1n],
         ])
       ),
     );
 
-  let settingsDatum = {
+  let settingsDatum: SettingsDatum = {
     settingsAdmin: multisigSignature(keyHash),
     metadataAdmin: paymentAddress(keyHash),
     treasuryAdmin: multisigSignature(keyHash),
     treasuryAddress: paymentAddress(keyHash),
     treasuryAllowance: { numerator: 1n, denominator: 10n },
-    authorizedScoopers: [keyHash],
-    authorizedStakingKeys: [{ tag: 121n, cred: keyHash }],
+    authorizedScoopers: [Buffer.from(keyHash.bytes())],
+    authorizedStakingKeys: [{ tag: 121n, cred: Buffer.from(keyHash.bytes()) }],
     baseFee: 1000000n,
     simpleFee: 1000000n,
     strategyFee: 1000000n,
@@ -759,7 +818,7 @@ function makeSettings(bp, keyHash) {
   };
 
   let settingsDatumPd = PlutusData.fromCbor(HexBlob(withEncoderHex(encodeSettingsDatum, settingsDatum)));
-  settingsInputOutput.setDatum(new Core.Datum(null, settingsDatumPd));
+  settingsInputOutput.setDatum(new Core.Datum(undefined, settingsDatumPd));
 
   let settings =
     new Core.TransactionUnspentOutput(
@@ -770,18 +829,18 @@ function makeSettings(bp, keyHash) {
   return settings;
 }
 
-function makeRandomPool(bp, keyHash) {
+function makeRandomPool(bp: Blueprint, keyHash: Ed25519KeyHash): [Core.TransactionUnspentOutput, Buffer] {
   let poolScriptHash = Buffer.from(bp.poolSpend.hash, "hex");
   let poolAddr = new Core.Address({
     type: Core.AddressType.BasePaymentScriptStakeKey,
     networkId: NetworkId.Testnet,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: bp.poolSpend.hash,
+      hash: Hash28ByteBase16(bp.poolSpend.hash),
     },
     delegationPart: {
       type: Core.CredentialType.KeyHash,
-      hash: keyHash.hex(),
+      hash: Hash28ByteBase16(keyHash.hex()),
     },
   });
 
@@ -792,14 +851,14 @@ function makeRandomPool(bp, keyHash) {
 
   let poolInput =
     new Core.TransactionInput(
-      Core.TransactionId(hexEncode(txid)),
+      Core.TransactionId(hexEncodeBuffer(txid)),
       0n
     );
 
   let rberryPolicy = "99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15";
   let rberryToken = "524245525259";
   let sberryToken = "534245525259";
-  let assetPair =
+  let assetPair: AssetPair =
     [
       [fromHex(rberryPolicy), fromHex(rberryToken)],
       [fromHex(rberryPolicy), fromHex(sberryToken)],
@@ -811,13 +870,13 @@ function makeRandomPool(bp, keyHash) {
       new Core.Value(
         23_000_000n,
         new Map([
-          [rberryPolicy + rberryToken, 100_000_000n],
-          [rberryPolicy + sberryToken, 100_000_000n],
-          [hexEncode(makePoolNft(poolScriptHash, identifier)), 1n],
+          [Core.AssetId(rberryPolicy + rberryToken), 100_000_000n],
+          [Core.AssetId(rberryPolicy + sberryToken), 100_000_000n],
+          [Core.AssetId(hexEncodeBuffer(makePoolNft(poolScriptHash, identifier))), 1n],
         ])
       ),
     );
-  let poolDatum = {
+  let poolDatum: PoolDatum = {
     identifier: identifier,
     assetPair: assetPair,
     circulatingLp: 100_000_000n,
@@ -825,14 +884,14 @@ function makeRandomPool(bp, keyHash) {
     askFees: 50n,
     feeManager: {
       tag: "Signature",
-      keyHash: keyHash.bytes(),
+      keyHash: Buffer.from(keyHash.bytes()),
     },
     marketOpen: 0n,
     protocolFees: 20_000_000n,
   };
 
   let poolDatumPd = PlutusData.fromCbor(HexBlob(withEncoderHex(encodePoolDatum, poolDatum)));
-  poolInputOutput.setDatum(new Core.Datum(null, poolDatumPd));
+  poolInputOutput.setDatum(new Core.Datum(undefined, poolDatumPd));
 
   let pool =
     new Core.TransactionUnspentOutput(
@@ -843,13 +902,13 @@ function makeRandomPool(bp, keyHash) {
   return [pool, identifier];
 }
 
-function makeScriptRef(address, validator) {
+function makeScriptRef(address: Address, validator: HexBlob) {
   let txid = randomTxId();
   txid[0] = 0xff;
 
   let refInput =
     new Core.TransactionInput(
-      Core.TransactionId(hexEncode(txid)),
+      Core.TransactionId(hexEncodeBuffer(txid)),
       0n
     );
 
@@ -871,12 +930,14 @@ function makeScriptRef(address, validator) {
     return ref;
 }
 
-async function testAutoWithdraw(argv) {
-  let testSkey = new Core.Ed25519PrivateKey(crypto.randomBytes(32), "Normal");
+async function testAutoWithdraw(argv: any) {
+  let testSkey = Core.Ed25519PrivateKey.fromNormalBytes(crypto.randomBytes(32));
   let testVkey = await testSkey.toPublic();
   let testPkh = await testVkey.hash();
 
-  let myAddress = Core.Address.fromBytes("60" + testPkh.hex());
+  console.log(`testPkh: ${testPkh.hex()}`);
+
+  let myAddress = Core.Address.fromBytes(Core.HexBlob("60" + testPkh.hex()));
 
   let emulator = new Emulator([]);
 
@@ -901,28 +962,31 @@ async function testAutoWithdraw(argv) {
     networkId: NetworkId.Testnet,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: bp.poolSpend.hash,
+      hash: Hash28ByteBase16(bp.poolSpend.hash),
     },
     delegationPart: {
       type: Core.CredentialType.KeyHash,
-      hash: testPkh.hex(),
+      hash: Hash28ByteBase16(testPkh.hex()),
     },
   });
 
-  let settings = makeSettings(bp, testPkh.bytes());
+  let settings = makeSettings(bp, testPkh);
   emulator.addUtxo(settings);
 
-  let settingsDatumCbor = settings.output().datum().asInlineData().toCbor();
+  let settingsDatumCbor = settings.output().datum()?.asInlineData()?.toCbor();
+  if (!settingsDatumCbor) {
+    throw new Error("Couldn't get inline datum of settings utxo");
+  }
   console.log(`settingsDatumCbor: ${settingsDatumCbor}`);
   let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
 
   let treasuryAddr = settingsDatum.treasuryAddress.bytes(network);
   console.log(`treasuryAddr: ${treasuryAddr}`);
 
-  let poolScriptRef = makeScriptRef(myAddress, bp.poolSpend.validator);
+  let poolScriptRef = makeScriptRef(myAddress, HexBlob(bp.poolSpend.validator));
   emulator.addUtxo(poolScriptRef);
 
-  let poolManageScriptRef = makeScriptRef(myAddress, bp.poolManage.validator);
+  let poolManageScriptRef = makeScriptRef(myAddress, HexBlob(bp.poolManage.validator));
   emulator.addUtxo(poolManageScriptRef);
 
   let references = [poolScriptRef, poolManageScriptRef];
@@ -940,24 +1004,24 @@ async function testAutoWithdraw(argv) {
     targetPool: poolIds[0].toString("hex"),
     signers: testPkh.hex(),
     withdrawnAmount: 10_000_000n,
+    remainingAmount: undefined,
     withheldAddress: myAddress,
     references: references,
     blueprint: bp,
-    treasuryAddress: Core.Address.fromBytes(treasuryAddr),
+    treasuryAddress: Core.Address.fromBytes(Core.HexBlob(treasuryAddr)),
   };
 
   const tx = await buildWithdrawPoolRewards(options);
   console.log(`Test tx: ${tx.toCbor()}`);
-
 }
 
-async function debugConditionedScoop(argv) {
+async function debugConditionedScoop(argv: any) {
   let myAddr = Core.Address.fromBech32("addr_test1vqp4mmnx647vyutfwugav0yvxhl6pdkyg69x4xqzfl4vwwck92a9t");
   let poolAddr = Core.Address.fromBech32("addr_test1xzly6g2kvwgfhdvntwfrct0kz9erfqyntw68yt2lz54kg6kvy7vq4p2hl6wm9jdvpgn80ax3xpkm7yrgnxphtrct3klqnkjjzt");
   let scriptRefAddr = Core.Address.fromBech32("addr_test1wza7ec20249sqg87yu2aqkqp735qa02q6yd93u28gzul93gvc4wuw");
   let poolScriptBytes = fs.readFileSync("poolScript", "utf8");
-  let poolScript = Script.newPlutusV3Script(new PlutusV3Script(poolScriptBytes));
-  let genesisOutputs = [];
+  let poolScript = Script.newPlutusV3Script(new PlutusV3Script(Core.HexBlob(poolScriptBytes)));
+  let genesisOutputs: Core.TransactionOutput[] = [];
   let emulator = new Emulator(genesisOutputs);
 
   let change1Input =
@@ -999,7 +1063,7 @@ async function debugConditionedScoop(argv) {
 
   let poolScriptReferenceInput =
     new Core.TransactionInput(
-      Core.TransactionId("45394d375379204a64d3fd6987afa83d1dd0c4f14a36094056f136bc21ed07b5"),
+      Core.TransactionId(Core.HexBlob("45394d375379204a64d3fd6987afa83d1dd0c4f14a36094056f136bc21ed07b5")),
       0n
     );
   let poolScriptReferenceInputOutput =
@@ -1018,7 +1082,7 @@ async function debugConditionedScoop(argv) {
 
   let poolInput =
     new Core.TransactionInput(
-      Core.TransactionId("4135f635b4f26859231c696699593781e04ffb8eef4576c9917694dcad61693b"),
+      Core.TransactionId(Core.HexBlob("4135f635b4f26859231c696699593781e04ffb8eef4576c9917694dcad61693b")),
       0n
     );
 
@@ -1028,13 +1092,13 @@ async function debugConditionedScoop(argv) {
       new Core.Value(
         13_000_000n,
         new Map([
-          ["99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15524245525259", 100000n],
-          ["be4d215663909bb5935b923c2df611723480935bb4722d5f152b646a000de140a4745a3d72cd31eba160563dbaa3538b574b21cb4a08aef57e18f457", 1n],
+          [Core.AssetId("99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15524245525259"), 100000n],
+          [Core.AssetId("be4d215663909bb5935b923c2df611723480935bb4722d5f152b646a000de140a4745a3d72cd31eba160563dbaa3538b574b21cb4a08aef57e18f457"), 1n],
         ])
       ),
     );
   let poolInputDatum = "d8799f581ca4745a3d72cd31eba160563dbaa3538b574b21cb4a08aef57e18f4579f9f4040ff9f581c99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e1546524245525259ffff1a000f42400a0ad87a80001a002dc6c0d8799f581c60c5ca218d3fa6ba7ecf4697a7a566ead9feb87068fc1229eddcf287ffd8799fd8799fa1581c99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e15a1465342455252591903e8d87980ffffff";
-  poolInputOutput.setDatum(new Core.Datum(null, PlutusData.fromCbor(poolInputDatum)));
+  poolInputOutput.setDatum(new Core.Datum(undefined, PlutusData.fromCbor(Core.HexBlob(poolInputDatum))));
 
   let pool =
     new Core.TransactionUnspentOutput(
@@ -1046,13 +1110,16 @@ async function debugConditionedScoop(argv) {
   emulator.addUtxo(pool);
   emulator.addUtxo(poolScriptReference);
 
-  let poolScoopRedeemer = PlutusData.fromCbor("d87a9fd8799f00009f9f01d87a8000ffffffff");
+  let poolScoopRedeemer = PlutusData.fromCbor(Core.HexBlob("d87a9fd8799f00009f9f01d87a8000ffffffff"));
 
   // a wallet with a null provider can still sign but other operations will fail
   //
   // in lucid, emulator implemented the provider interface. but apparently not
   // in blaze
-  let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, null);
+  if (!skeyHex) {
+    throw new Error("Missing skey");
+  }
+  let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, new EmulatorProvider(emulator));
   console.log(`emulator: initialized`);
   let tx = new TxBuilder(emulator.params)
     .addInput(pool, poolScoopRedeemer)
@@ -1076,7 +1143,7 @@ async function debugConditionedScoop(argv) {
   console.log(`emulator: submitted tx: ${txid}`);
 }
 
-async function registerStakeAddress(argv) {
+async function registerStakeAddress(argv: any) {
   let address = Core.addressFromBech32(argv.address);
 
   const cred = {
@@ -1101,13 +1168,14 @@ async function registerStakeAddress(argv) {
 
     .setMinimumFee(289741n)
 
-    .addRegisterStake(new Core.Credential(cred))
+    .addRegisterStake(Core.Credential.fromCore(cred))
 
     //.useCoinSelector((inputs, dearth) => {
     //  return {
     //    selectedInputs: [],
     //    selectedValue: new Value(0n),
     //    inputs: [],
+    //    leftoverInputs: [],
     //  }
     //});
 
@@ -1128,7 +1196,7 @@ async function registerStakeAddress(argv) {
   }
 }
 
-async function updateAllPoolStakeCredentials(argv) {
+async function updateAllPoolStakeCredentials(argv: any) {
   let address = Core.addressFromBech32(argv.address);
   let knownPools = await provider.getUnspentOutputs(Core.addressFromBech32(argv.poolAddress));
   let valid = 0n;
@@ -1187,16 +1255,36 @@ async function updateAllPoolStakeCredentials(argv) {
   }
 }
 
-async function buildWithdrawPoolRewards(options) {
+interface BuildWithdrawPoolRewards {
+  blaze: Blaze<Provider, Wallet>,
+  provider: Provider,
+  settings: Core.TransactionUnspentOutput,
+  change: Core.TransactionUnspentOutput,
+  targetPool: string,
+  signers: string,
+  withdrawnAmount: bigint,
+  remainingAmount: bigint | undefined,
+  withheldAddress: Address,
+  references: Core.TransactionUnspentOutput[],
+  blueprint: any,
+  treasuryAddress: Address,
+  poolAddress: Address,
+}
+
+async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
   let targetPool = await findPoolByIdent(options.provider, options.poolAddress, options.targetPool);
   if (!targetPool) {
     throw new Error(`Couldn't find pool utxo with target ident ${options.targetPool}`);
   }
   let targetPoolDatum = targetPool.output().datum();
-  if (targetPoolDatum.kind() != DatumKind.InlineData) {
-    throw new Error(`Missing inline datum on target pool (datum kind is ${targetPoolDatum.datumKind})`);
+  if (!targetPoolDatum) {
+    throw new Error(`Missing datum on target pool`);
   }
-  let datumCbor = targetPoolDatum.asInlineData().toCbor();
+  let targetPoolDatumInline = targetPoolDatum.asInlineData();
+  if (!targetPoolDatumInline) {
+    throw new Error(`Missing inline datum on target pool`);
+  }
+  let datumCbor = targetPoolDatumInline.toCbor();
   console.log(`pool datum: ${datumCbor}`);
   let newPoolDatum = decodePoolDatum(decoder(fromHex(datumCbor)));
   console.log(`decoded pool datum: ${stringify(newPoolDatum)}`);
@@ -1215,7 +1303,7 @@ async function buildWithdrawPoolRewards(options) {
   let toSpend = [];
   toSpend.push(options.change);
   toSpend.push(targetPool);
-  toSpend.sort((a, b) => a.input().transactionId() == b.input().transactionId() ? a.input().index() - b.input().index() : (a.input().transactionId() < b.input().transactionId() ? -1 : 1));
+  toSpend.sort((a, b) => a.input().transactionId() == b.input().transactionId() ? Number(a.input().index() - b.input().index()) : (a.input().transactionId() < b.input().transactionId() ? -1 : 1));
   let poolInputIndex = 0n;
   for (let e of toSpend) {
     if (e.output().address() == targetPool.output().address()) {
@@ -1271,7 +1359,7 @@ async function buildWithdrawPoolRewards(options) {
   tx.addReferenceInput(options.settings);
 
   for (let s of options.signers.split(",")) {
-    tx.addRequiredSigner(s);
+    tx.addRequiredSigner(Core.Ed25519KeyHashHex(s));
   }
 
   tx.addWithdrawal(
@@ -1291,7 +1379,7 @@ async function buildWithdrawPoolRewards(options) {
 
   let treasuryDatum = PlutusData.fromCbor(HexBlob("d87980"));
 
-  if (options.treasuryAddress.getProps().paymentPart.type == Core.CredentialType.ScriptHash) {
+  if (options.treasuryAddress.getProps().paymentPart?.type == Core.CredentialType.ScriptHash) {
     tx.lockAssets(
       options.treasuryAddress,
       new Value(treasuryAmount),
@@ -1317,6 +1405,7 @@ async function buildWithdrawPoolRewards(options) {
       selectedInputs: [],
       selectedValue: new Value(0n),
       inputs: [],
+      leftoverInputs: [],
     }
   });
 
@@ -1333,7 +1422,7 @@ async function buildWithdrawPoolRewards(options) {
   return completed;
 }
 
-async function queryPools(poolAddress, needed) {
+async function queryPools(poolAddress: string, needed: bigint) {
   let poolUtxos = await provider.getUnspentOutputs(Core.addressFromBech32(poolAddress));
   let pools = [];
   for (let poolUtxo of poolUtxos) {
@@ -1388,13 +1477,13 @@ async function queryPools(poolAddress, needed) {
 
 // This takes a *builder* as an argument to allow automatic retrying in cases
 // where there is contention for one of the tx inputs.
-async function submitAndAwaitWithRetry(provider, buildTx) {
+async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, buildTx: () => Promise<Transaction>) {
   let confirmed = false;
   while (!confirmed) {
     let tx = await buildTx();
-    let hash = await provider.submitTransaction(tx);
+    let hash = await blaze.submitTransaction(tx);
     console.log(`Submitted (${hash})...`);
-    confirmed = await provider.awaitTransactionConfirmation(hash, 60_000);
+    confirmed = await blaze.provider.awaitTransactionConfirmation(hash, 60_000);
     if (confirmed) {
       console.log(`Confirmed ${hash}`);
     } else {
@@ -1403,7 +1492,7 @@ async function submitAndAwaitWithRetry(provider, buildTx) {
   }
 }
 
-async function autoWithdrawRewards(argv) {
+async function autoWithdrawRewards(argv: any) {
   // 1. 'queryPools': Compute optimal set of pools to withdraw from:
   //   a. Query all withdrawable pools
   //   b. Sort by amount of withdrawable funds
@@ -1428,12 +1517,15 @@ async function autoWithdrawRewards(argv) {
     networkId: network,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: bp.settingsSpend.hash,
+      hash: Hash28ByteBase16(bp.settingsSpend.hash),
     },
   });
 
   const settings = await findSettings(provider, settingsAddress, bp.settingsSpend.hash);
-  let settingsDatumCbor = settings.output().datum().asInlineData().toCbor();
+  let settingsDatumCbor = settings.output().datum()?.asInlineData()?.toCbor();
+  if (!settingsDatumCbor) {
+    throw new Error("Couldn't get settings datum");
+  }
   console.log(settingsDatumCbor);
   let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
 
@@ -1447,7 +1539,7 @@ async function autoWithdrawRewards(argv) {
       )
     );
   }
-  let references = [];
+  let references: Core.TransactionUnspentOutput[] = [];
   if (referenceRefs.length > 0) {
     references = await provider.resolveUnspentOutputs(referenceRefs);
   }
@@ -1473,26 +1565,26 @@ async function autoWithdrawRewards(argv) {
       targetPool: todo[i].pool.ident.toString("hex"),
       signers: argv.signers,
       withdrawnAmount: todo[i].amount,
-      treasuryAmount: 1_000_000n,
+      remainingAmount: undefined,
       withheldAddress: Core.addressFromBech32(argv.withheldAddress),
       references: references,
       blueprint: bp,
-      treasuryAddress: Core.Address.fromBytes(settingsDatum.treasuryAddress.bytes(network)),
+      treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(network))),
       poolAddress: Core.addressFromBech32(argv.poolAddress),
     };
 
     if (argv.forceSubmit) {
-      await submitAndAwaitWithRetry(provider, async () => {
+      await submitAndAwaitWithRetry(blaze, async () => {
         const tx = await buildWithdrawPoolRewards(options);
-        await provider.signTransaction(tx);
+        await blaze.signTransaction(tx);
         return tx;
       });
     } else if (argv.submit) {
       const tx = await buildWithdrawPoolRewards(options);
-      await provider.signTransaction(tx);
+      await blaze.signTransaction(tx);
       const response = prompt("Type 'submit' to submit");
       if (response == "submit") {
-        await signedTx.submit();
+        await blaze.submitTransaction(tx);
         console.log("Submitted");
       }
     } else {
@@ -1521,8 +1613,8 @@ if (argv.buildUpdateFeeManager) {
   await registerStakeAddress(argv);
 } else if (argv.debugConditionedScoop) {
   await debugConditionedScoop(argv);
-} else if (argv.withdrawGenericStake) {
-  await withdrawGenericStake(argv);
+//} else if (argv.withdrawGenericStake) {
+//  await withdrawGenericStake(argv);
 } else if (argv.autoWithdrawRewards) {
   await autoWithdrawRewards(argv);
 } else if (argv.testAutoWithdraw) {
