@@ -20,7 +20,7 @@ import {
   TransactionInput,
   Value,
 } from "@blaze-cardano/core";
-import { HotSingleWallet, Core, Blaze, Blockfrost, Provider, Wallet } from "@blaze-cardano/sdk";
+import { ColdWallet, HotSingleWallet, Core, Blaze, Blockfrost, Provider, Wallet } from "@blaze-cardano/sdk";
 import { TxBuilder } from "@blaze-cardano/tx";
 import { Emulator, EmulatorProvider } from "@blaze-cardano/emulator";
 import { Ed25519KeyHash } from "@cardano-sdk/crypto";
@@ -57,37 +57,6 @@ import {
   fromHex,
   stringify,
 } from "./util.js";
-
-const projectId = process.env["BLOCKFROST_PROJECT_ID"];
-if (!projectId) {
-  throw new Error("Missing blockfrost key");
-}
-
-let provider: Provider;
-if (process.env["MAINNET"]) {
-  provider = new Blockfrost({
-    network: "cardano-mainnet",
-    projectId,
-  });
-} else {
-  provider = new Blockfrost({
-    network: "cardano-preview",
-    projectId,
-  });
-}
-
-const skeyHex = process.env["SKEY_HEX"];
-if (!skeyHex) {
-  throw new Error("Missing skey");
-}
-let network: NetworkId;
-if (process.env["MAINNET"]) {
-  network = NetworkId.Mainnet;
-} else {
-  network = NetworkId.Testnet;
-}
-const wallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, provider);
-const blaze = await Blaze.from(provider, wallet);
 
 function hexEncode(s: string): string {
   return Buffer.from(s, "utf8").toString("hex");
@@ -141,7 +110,8 @@ async function findPoolByIdent(provider: Provider, poolAddress: Core.Address, po
   return pool;
 }
 
-async function findChange(address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput> {
+// Find a change utxo in the wallet having at least the given amount
+async function findChange(provider: Provider, address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput> {
   const utxos: Core.TransactionUnspentOutput[] = await provider.getUnspentOutputs(address);
   for (const utxo of utxos) {
     // Skip utxos with assets
@@ -164,7 +134,8 @@ async function findChange(address: Core.Address, amount: bigint): Promise<Core.T
   throw new Error(`Couldn't find a change utxo with ${amount} lovelace`);
 }
 
-async function findChangeMany(address: Core.Address, amount: bigint, count: bigint): Promise<Core.TransactionUnspentOutput[]> {
+// Collect many change utxos each having a minimum amount
+async function findChangeMany(provider: Provider, address: Core.Address, amount: bigint, count: bigint): Promise<Core.TransactionUnspentOutput[]> {
   const utxos = await provider.getUnspentOutputs(address);
   let change = [];
   for (const utxo of utxos) {
@@ -194,7 +165,34 @@ async function findChangeMany(address: Core.Address, amount: bigint, count: bigi
   return change;
 }
 
-
+// Collect many change utxos to meet a desired total
+async function collectChange(provider: Provider, address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput[]> {
+  const utxos = await provider.getUnspentOutputs(address);
+  let change = [];
+  let sum = 0n;
+  utxos.sort(compareUtxo);
+  for (const utxo of utxos) {
+    // Skip utxos with assets
+    let ma = utxo.output().amount().multiasset();
+    if (ma != undefined && ma.size > 0) {
+      continue;
+    }
+    // Skip utxos with scripts
+    if (utxo.output().scriptRef()) {
+      continue;
+    }
+    // Skip utxos with datums
+    if (utxo.output().datum()) {
+      continue;
+    }
+    change.push(utxo);
+    sum += utxo.output().amount().coin();
+    if (sum >= amount) {
+      return change;
+    }
+  }
+  throw new Error(`Couldn't find enough change: want ${amount} but only ${sum} is available from among ${change.length} eligible change utxos`);
+}
 
 function compareUtxo(a: Core.TransactionUnspentOutput, b: Core.TransactionUnspentOutput): number {
   if (a.input().transactionId() < b.input().transactionId()) {
@@ -250,6 +248,8 @@ function decodeBlueprint(blueprint: string): Blueprint {
 }
 
 async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
+  let { blaze, provider } = await setupBlaze();
+
   let bp = decodeBlueprint(fs.readFileSync(args.blueprint, "utf8"));
   let poolAddress = Core.addressFromBech32(args.poolAddress);
 
@@ -282,7 +282,7 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
   }
   let newPoolDatum = PlutusData.fromCbor(HexBlob(withEncoderHex(encodePoolDatum, poolDatumDecoded)));
 
-  let myChange = await findChange(address, 20_000_000n);
+  let myChange = await findChange(provider, address, 20_000_000n);
 
   if (!myChange) {
     throw new Error("can't find change");
@@ -316,7 +316,7 @@ async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
 
   const poolManageAddress = new Core.Address({
     type: Core.AddressType.RewardScript,
-    networkId: network,
+    networkId: provider.network,
     // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
@@ -447,6 +447,7 @@ function prepareUpdate(argv: any) {
 }
 
 async function signMessage(argv: any) {
+  const skeyHex = process.env["SKEY_HEX"];
   let key = skeyHex;
   if (key == undefined) {
     throw new Error(`signing key not configured`);
@@ -499,6 +500,7 @@ async function makeRedeemer(argv: any) {
 }
 
 async function updateFeeManager(argv: any) {
+  let { blaze, provider } = await setupBlaze();
   let completed = await buildUpdateFeeManager(argv);
   if (argv.submit) {
     let signed = await blaze.signTransaction(completed);
@@ -517,6 +519,7 @@ async function updateFeeManager(argv: any) {
 }
 
 async function updatePoolStakeCredential(args: any, pool: Core.TransactionUnspentOutput, change: Core.TransactionUnspentOutput) {
+  let { blaze, provider } = await setupBlaze();
   let bp = decodeBlueprint(fs.readFileSync(args.blueprint, "utf8"));
   let poolAddress = pool.output().address();
 
@@ -529,7 +532,7 @@ async function updatePoolStakeCredential(args: any, pool: Core.TransactionUnspen
 
   const poolManageAddress = new Core.Address({
     type: Core.AddressType.RewardScript,
-    networkId: network,
+    networkId: provider.network,
     // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
@@ -638,6 +641,7 @@ async function updatePoolStakeCredential(args: any, pool: Core.TransactionUnspen
 }
 
 async function updateSinglePoolStakeCredential(argv: any) {
+  let { blaze, provider } = await setupBlaze();
   let address = Core.addressFromBech32(argv.address);
   let poolAddress = Core.addressFromBech32(argv.poolAddress);
 
@@ -669,7 +673,7 @@ async function updateSinglePoolStakeCredential(argv: any) {
   if (!pool) {
     throw new Error(`couldn't find the pool ${argv.poolIdent}`);
   }
-  let change = await findChange(address, 20_000_000n);
+  let change = await findChange(provider, address, 20_000_000n);
   let completed = await updatePoolStakeCredential(argv, pool, change);
   if (argv.submit) {
     let signed = await blaze.signTransaction(completed);
@@ -756,7 +760,7 @@ function makeChange(myAddress: Address, amount: bigint): Core.TransactionUnspent
       new Core.Value(amount),
   );
 
-  let utxo = 
+  let utxo =
     new Core.TransactionUnspentOutput(input, output);
 
   return utxo;
@@ -947,9 +951,9 @@ async function testAutoWithdraw(argv: any) {
     changes.push(change);
     emulator.addUtxo(change);
   }
-  
+
   let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
-  
+
   let poolIds = [];
   for (let i = 0; i < 10; i++) {
     let [pool, identifier] = makeRandomPool(bp, testPkh);
@@ -957,9 +961,11 @@ async function testAutoWithdraw(argv: any) {
     emulator.addUtxo(pool);
   }
 
+  let network = NetworkId.Testnet;
+
   let poolAddress = new Core.Address({
     type: Core.AddressType.BasePaymentScriptStakeKey,
-    networkId: NetworkId.Testnet,
+    networkId: network,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
       hash: Hash28ByteBase16(bp.poolSpend.hash),
@@ -1010,6 +1016,13 @@ async function testAutoWithdraw(argv: any) {
     blueprint: bp,
     treasuryAddress: Core.Address.fromBytes(Core.HexBlob(treasuryAddr)),
   };
+
+  for (let utxo of emulator.utxos()) {
+    let txid = txref(utxo);
+    let cbor = utxo.output().datum()?.asInlineData()?.toCbor();
+    console.log(`${txid}: ${cbor}`);
+    console.log(utxo.toCbor());
+  }
 
   const tx = await buildWithdrawPoolRewards(options);
   console.log(`Test tx: ${tx.toCbor()}`);
@@ -1110,16 +1123,17 @@ async function debugConditionedScoop(argv: any) {
   emulator.addUtxo(pool);
   emulator.addUtxo(poolScriptReference);
 
+  let provider = new EmulatorProvider(emulator);
+  const skeyHex = process.env["SKEY_HEX"];
+  if (!skeyHex) {
+    throw new Error(`signing key not configured`);
+  }
+
+  let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), provider.network, provider);
+  let blaze = await Blaze.from(provider, myWallet);
+
   let poolScoopRedeemer = PlutusData.fromCbor(Core.HexBlob("d87a9fd8799f00009f9f01d87a8000ffffffff"));
 
-  // a wallet with a null provider can still sign but other operations will fail
-  //
-  // in lucid, emulator implemented the provider interface. but apparently not
-  // in blaze
-  if (!skeyHex) {
-    throw new Error("Missing skey");
-  }
-  let myWallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, new EmulatorProvider(emulator));
   console.log(`emulator: initialized`);
   let tx = new TxBuilder(emulator.params)
     .addInput(pool, poolScoopRedeemer)
@@ -1128,7 +1142,7 @@ async function debugConditionedScoop(argv: any) {
     .useEvaluator(emulator.evaluator)
     .addReferenceInput(poolScriptReference)
     .setChangeAddress(myAddr)
-    .setNetworkId(network);
+    .setNetworkId(provider.network);
   let completed = await tx.complete();
 
   // HotSingleWallet.signTransaction doesn't mutate the tx, it returns a witness
@@ -1144,6 +1158,7 @@ async function debugConditionedScoop(argv: any) {
 }
 
 async function registerStakeAddress(argv: any) {
+  let { blaze, provider } = await setupBlaze();
   let address = Core.addressFromBech32(argv.address);
 
   const cred = {
@@ -1152,12 +1167,12 @@ async function registerStakeAddress(argv: any) {
   };
   const stakeAddress = new Core.Address({
     type: Core.AddressType.RewardScript,
-    networkId: network,
+    networkId: provider.network,
     // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
     paymentPart: cred,
   });
 
-  let change = await findChange(address, 20_000_000n);
+  let change = await findChange(provider, address, 20_000_000n);
   let inputs = [change];
 
   let tx = blaze
@@ -1197,6 +1212,7 @@ async function registerStakeAddress(argv: any) {
 }
 
 async function updateAllPoolStakeCredentials(argv: any) {
+  let { blaze, provider } = await setupBlaze();
   let address = Core.addressFromBech32(argv.address);
   let knownPools = await provider.getUnspentOutputs(Core.addressFromBech32(argv.poolAddress));
   let valid = 0n;
@@ -1224,7 +1240,7 @@ async function updateAllPoolStakeCredentials(argv: any) {
     throw new Error(`couldn't find the desired number of pools: ${pools.length}/${argv.count}`);
   }
   let hashes = [];
-  let change = await findChangeMany(address, 7_000_000n, argv.count);
+  let change = await findChangeMany(provider, address, 7_000_000n, argv.count);
   for (let i = 0; i < argv.count; i++) {
     let thisPool = pools[i];
     let thisChange = change[i];
@@ -1266,7 +1282,7 @@ interface BuildWithdrawPoolRewards {
   remainingAmount: bigint | undefined,
   withheldAddress: Address,
   references: Core.TransactionUnspentOutput[],
-  blueprint: any,
+  blueprint: Blueprint,
   treasuryAddress: Address,
   poolAddress: Address,
 }
@@ -1335,11 +1351,11 @@ async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
 
   const poolManageAddress = new Core.Address({
     type: Core.AddressType.RewardScript,
-    networkId: network,
+    networkId: options.provider.network,
     // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: options.blueprint.poolManage.hash,
+      hash: Hash28ByteBase16(options.blueprint.poolManage.hash),
     },
   });
 
@@ -1347,11 +1363,6 @@ async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
     .newTransaction()
     .addInput(options.change)
     .addInput(targetPool, PlutusData.fromCbor(poolSpendRedeemer));
-
-  //const tx = blaze
-  //  .newTransaction()
-  //  .addInput(options.change)
-  //  .addInput(targetPool, PlutusData.fromCbor(poolSpendRedeemer));
 
   for (let ref of options.references) {
     tx.addReferenceInput(ref);
@@ -1368,7 +1379,14 @@ async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
     PlutusData.fromCbor(poolManageRedeemer)
   );
 
-  let newPoolValue = targetPool.output().amount();
+  //let newPoolValue = targetPool.output().amount();
+  //newPoolValue.setCoin(newPoolValue.coin() - withdrawnAmount);
+
+  let newPoolValue = new Core.Value(targetPool.output().amount().coin());
+  let targetPoolMa = targetPool.output().amount().multiasset();
+  if (targetPoolMa) {
+    newPoolValue.setMultiasset(new Map(targetPoolMa));
+  }
   newPoolValue.setCoin(newPoolValue.coin() - withdrawnAmount);
 
   tx.lockAssets(
@@ -1422,7 +1440,7 @@ async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
   return completed;
 }
 
-async function queryPools(poolAddress: string, needed: bigint) {
+async function queryPools(provider: Provider, poolAddress: string, needed: bigint) {
   let poolUtxos = await provider.getUnspentOutputs(Core.addressFromBech32(poolAddress));
   let pools = [];
   for (let poolUtxo of poolUtxos) {
@@ -1492,17 +1510,358 @@ async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, buildTx: 
   }
 }
 
-async function autoWithdrawRewards(argv: any) {
+async function setupBlaze(): Promise<{ blaze: Blaze<Provider, Wallet>, provider: Provider }> {
+  const projectId = process.env["BLOCKFROST_PROJECT_ID"];
+  if (!projectId) {
+    throw new Error("Missing blockfrost key");
+  }
+
+  let provider: Provider;
+  if (process.env["MAINNET"]) {
+    provider = new Blockfrost({
+      network: "cardano-mainnet",
+      projectId,
+    });
+  } else {
+    provider = new Blockfrost({
+      network: "cardano-preview",
+      projectId,
+    });
+  }
+
+  let network: NetworkId;
+  if (process.env["MAINNET"]) {
+    network = NetworkId.Mainnet;
+  } else {
+    network = NetworkId.Testnet;
+  }
+
+  const skeyHex = process.env["SKEY_HEX"];
+  let wallet: Wallet;
+  if (skeyHex) {
+    wallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, provider);
+  } else {
+    wallet = new ColdWallet(Core.addressFromBech32(argv.walletAddress), network, provider);
+  }
+
+  let blaze = await Blaze.from(provider, wallet);
+
+  return {
+    blaze,
+    provider,
+  };
+}
+
+interface PayoutOptions {
+  blaze: Blaze<Provider, Wallet>,
+  provider: Provider,
+  walletAddress: Address,
+  poolAddress: string,
+  reportFile: string,
+  addressesFile: string,
+  references: string,
+  blueprint: Blueprint,
+  withheldAddress: Address,
+  submit: boolean | undefined,
+  forceSubmit: boolean | undefined,
+  signers: string,
+  tokenHoldersDestination: Address,
+  otherPaymentsDestination: Address,
+}
+
+//let bp = decodeBlueprint(fs.readFileSync(options.blueprint, "utf8"));
+
+async function payouts(argv: any) {
+  let { blaze, provider } = await setupBlaze();
+  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint as string, "utf8"));
+  let payoutOptions: PayoutOptions = {
+    addressesFile: argv.addressesFile as string,
+    reportFile: argv.reportFile as string,
+    poolAddress: argv.poolAddress as string,
+    blaze: blaze,
+    provider: provider,
+    walletAddress: Core.addressFromBech32(argv.walletAddress as string),
+    references: argv.references as string,
+    blueprint: bp,
+    withheldAddress: Core.addressFromBech32(argv.withheldAddress as string),
+    submit: argv.submit,
+    forceSubmit: argv.forceSubmit,
+    signers: argv.signers as string,
+    tokenHoldersDestination: Core.addressFromBech32(argv.tokenHoldersDestination as string),
+    otherPaymentsDestination: Core.addressFromBech32(argv.otherPaymentsDestination as string),
+  };
+  await doPayouts(payoutOptions);
+}
+
+async function doPayouts(options: PayoutOptions) {
+  let addressesJson = fs.readFileSync(options.addressesFile, "utf8");
+  let addresses = decodeAddressesFromJson(addressesJson);
+  let reportJson = fs.readFileSync(options.reportFile, "utf8");
+  let report = decodeReportFromJson(reportJson);
+  let payments = computePayments(report, addresses);
+  let autoWithdrawOptions: AutoWithdrawOptions = {
+    poolAddress: options.poolAddress,
+    needed: report.protocolFeesNeeded,
+    walletAddress: options.walletAddress,
+    blueprint: options.blueprint,
+    blaze: options.blaze,
+    provider: options.provider,
+    references: options.references,
+    submit: options.submit,
+    forceSubmit: options.forceSubmit,
+    withheldAddress: options.withheldAddress,
+    signers: options.signers,
+  };
+  await autoWithdrawRewards(autoWithdrawOptions);
+  let change = await collectChange(
+    options.provider,
+    options.walletAddress,
+    report.extraPayments.totalPayout + 20_000_000n,
+  );
+  let buildPayoutOptions: BuildPayoutOptions = {
+    changeUtxos: change,
+    blaze: options.blaze,
+    report: report,
+    tokenHoldersDestination: options.tokenHoldersDestination,
+    otherPaymentsDestination: options.otherPaymentsDestination,
+    scooperPayments: payments,
+    submit: options.submit,
+    forceSubmit: options.forceSubmit,
+  }
+  await payout(buildPayoutOptions);
+}
+
+interface AutoWithdrawOptions {
+  poolAddress: string,
+  needed: bigint,
+  walletAddress: Address,
+  blueprint: Blueprint,
+  blaze: Blaze<Provider, Wallet>,
+  provider: Provider,
+  references: string,
+  submit: boolean | undefined,
+  forceSubmit: boolean | undefined,
+  withheldAddress: Address,
+  signers: string,
+}
+
+function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet>, provider: Provider): AutoWithdrawOptions {
+  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
+  return {
+    poolAddress: argv.poolAddress,
+    needed: BigInt(argv.needed),
+    walletAddress: Core.addressFromBech32(argv.walletAddress),
+    blueprint: bp,
+    blaze: blaze,
+    provider: provider,
+    references: argv.references,
+    submit: argv.submit,
+    forceSubmit: argv.forceSubmit,
+    signers: argv.signers,
+    withheldAddress: Core.addressFromBech32(argv.withheldAddress),
+  }
+}
+
+interface Report {
+  feesPaid: FeesPaid,
+  totalScoopers: bigint,
+  protocolFeesNeeded: bigint,
+  extraPayments: ExtraPayments,
+}
+
+type FeesPaid = Map<string, bigint>;
+
+interface ExtraPayments {
+  sundaeAWSFee: bigint,
+  sundaeMiscFee: bigint,
+  tokenHoldersFee: bigint,
+  usdmFundFee: bigint,
+  flat: bigint,
+  totalPayout: bigint,
+}
+
+type Addresses = Map<string, Address>;
+
+function decodeAddressesFromJson(json: string): Addresses {
+  let obj = JSON.parse(json);
+  let addresses = new Map();
+  for (const [name, addrs] of Object.entries(obj.scoopers)) {
+    let addr = Core.addressFromBech32((addrs as { reward: string }).reward);
+    addresses.set(name, addr);
+  }
+  return addresses;
+}
+
+function decodeReportFromJson(json: string): Report {
+  let obj = JSON.parse(json);
+  let report: Report = {
+    feesPaid: new Map(),
+    totalScoopers: 0n,
+    protocolFeesNeeded: 0n,
+    extraPayments: {
+      sundaeAWSFee: 0n,
+      sundaeMiscFee: 0n,
+      tokenHoldersFee: 0n,
+      usdmFundFee: 0n,
+      flat: 0n,
+      totalPayout: 0n,
+    },
+  };
+
+  for (const [scooperName, feesPaid] of Object.entries(obj.feesPaid)) {
+    report.feesPaid.set(scooperName, BigInt(feesPaid as number));
+  }
+  if (!obj.totalScoopers) {
+    throw new Error("Missing 'totalScoopers'");
+  }
+  report.totalScoopers = BigInt(obj.totalScoopers);
+
+  if (!obj.extraPayments) {
+    throw new Error("Missing 'extraPayments'");
+  }
+  if (!obj.extraPayments.sundaeAWSFee) {
+    throw new Error("Missing 'extraPayments.sundaeAWSFee'");
+  }
+  report.extraPayments.sundaeAWSFee = BigInt(obj.extraPayments.sundaeAWSFee);
+  if (!obj.extraPayments.sundaeMiscFee) {
+    throw new Error("Missing 'extraPayments.sundaeMiscFee'");
+  }
+  report.extraPayments.sundaeMiscFee = BigInt(obj.extraPayments.sundaeMiscFee);
+  if (!obj.extraPayments.tokenHoldersFee) {
+    throw new Error("Missing 'extraPayments.tokenHoldersFee'");
+  }
+  report.extraPayments.tokenHoldersFee = BigInt(obj.extraPayments.tokenHoldersFee);
+  if (!obj.extraPayments.usdmFundFee) {
+    throw new Error("Missing 'extraPayments.usdmFundFee'");
+  }
+  report.extraPayments.usdmFundFee = BigInt(obj.extraPayments.usdmFundFee);
+
+  if (!obj.extraPayments.flat) {
+    throw new Error("Missing 'extraPayments.flat'");
+  }
+  report.extraPayments.flat = BigInt(obj.extraPayments.flat);
+
+  if (!obj.extraPayments.totalPayout) {
+    throw new Error("Missing 'extraPayments.totalPayout'");
+  }
+  report.extraPayments.totalPayout = BigInt(obj.extraPayments.totalPayout);
+
+  if (!obj.protocolFeesNeeded) {
+    throw new Error("Missing 'protocolFeesNeeded'");
+  }
+  report.protocolFeesNeeded = BigInt(obj.protocolFeesNeeded);
+
+  return report;
+}
+
+interface Payment {
+  address: Address,
+  lovelace: bigint,
+}
+
+// Given a revenue report, compute a list of payments to scoopers, and a list of
+// additional payments according to the scooper payment agreement
+function computePayments(report: Report, addresses: Addresses): Payment[] {
+  let payments = [];
+  for (const [scooperName, feesPaid] of report.feesPaid) {
+    let resolvedAddress = addresses.get(scooperName);
+    if (!resolvedAddress) {
+      throw new Error(`Couldn't resolve an address for scooper ${scooperName}`);
+    }
+    let totalPayment = feesPaid + report.extraPayments.flat;
+    payments.push({ address: resolvedAddress, lovelace: totalPayment });
+  }
+  return payments;
+}
+
+function displayPreviousMonth(date: Date) {
+  let month = date.getMonth();
+  let year = date.getFullYear();
+  if (month == 0) {
+    year -= 1;
+    month = 12;
+  }
+  return `${year}-${month.toString().padStart(2, '0')}`;
+}
+
+interface BuildPayoutOptions {
+  changeUtxos: Core.TransactionUnspentOutput[],
+  blaze: Blaze<Provider, Wallet>,
+  report: Report,
+  tokenHoldersDestination: Address,
+  otherPaymentsDestination: Address,
+  scooperPayments: Payment[],
+  submit: boolean | undefined,
+  forceSubmit: boolean | undefined,
+}
+
+async function payout(options: BuildPayoutOptions) {
+  const tx = options.blaze.newTransaction();
+
+  for (const change of options.changeUtxos) {
+    tx.addInput(change);
+  }
+
+  for (const payment of options.scooperPayments) {
+    tx.payAssets(payment.address, new Core.Value(payment.lovelace));
+  }
+  tx.payAssets(
+    options.tokenHoldersDestination,
+    new Core.Value(options.report.extraPayments.tokenHoldersFee),
+  );
+  tx.payAssets(
+    options.otherPaymentsDestination,
+    new Core.Value(options.report.extraPayments.sundaeMiscFee),
+  );
+  tx.payAssets(
+    options.otherPaymentsDestination,
+    new Core.Value(options.report.extraPayments.sundaeAWSFee),
+  );
+  tx.payAssets(
+    options.otherPaymentsDestination,
+    new Core.Value(options.report.extraPayments.usdmFundFee),
+  );
+
+  // TODO: Attach breakdown metadata
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+
+  if (options.forceSubmit) {
+    let completed = await tx.complete();
+    await options.blaze.signTransaction(completed);
+    await options.blaze.submitTransaction(completed);
+    console.log("Submitted");
+  } else if (options.submit) {
+    let completed = await tx.complete();
+    await options.blaze.signTransaction(completed);
+    const response = prompt("Type 'submit' to submit");
+    if (response == "submit") {
+      await options.blaze.submitTransaction(completed);
+      console.log("Submitted");
+    }
+  } else {
+    console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
+  }
+}
+
+async function autoWithdrawRewards(options: AutoWithdrawOptions) {
   // 1. 'queryPools': Compute optimal set of pools to withdraw from:
   //   a. Query all withdrawable pools
   //   b. Sort by amount of withdrawable funds
   //   c. Select prefix that satisfies needed amount of funds, call the length of this prefix N
   // 2. 'findChangeMany': Provision N change utxos in our wallet
   // 3. For each pool, build and submit a withdrawal TX using the `i`th change utxo (disabling automatic change selection), retrying if the submission fails due to scooper contention (usually at least one of the withdrawals needs to be retried in practice).
-  let todo = await queryPools(argv.poolAddress, BigInt(argv.needed));
+  let todo = await queryPools(options.provider, options.poolAddress, options.needed);
   console.log(todo);
 
-  let change = await findChangeMany(Core.addressFromBech32(argv.walletAddress), 10_000_000n, BigInt(todo.length));
+  let change = await findChangeMany(options.provider, options.walletAddress, 10_000_000n, BigInt(todo.length));
   for (let c of change) {
     console.log({
       hash: c.input().transactionId(),
@@ -1510,18 +1869,16 @@ async function autoWithdrawRewards(argv: any) {
     });
   }
 
-  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
-
   const settingsAddress = new Core.Address({
     type: Core.AddressType.EnterpriseScript,
-    networkId: network,
+    networkId: options.provider.network,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: Hash28ByteBase16(bp.settingsSpend.hash),
+      hash: Hash28ByteBase16(options.blueprint.settingsSpend.hash),
     },
   });
 
-  const settings = await findSettings(provider, settingsAddress, bp.settingsSpend.hash);
+  const settings = await findSettings(options.provider, settingsAddress, options.blueprint.settingsSpend.hash);
   let settingsDatumCbor = settings.output().datum()?.asInlineData()?.toCbor();
   if (!settingsDatumCbor) {
     throw new Error("Couldn't get settings datum");
@@ -1529,7 +1886,7 @@ async function autoWithdrawRewards(argv: any) {
   console.log(settingsDatumCbor);
   let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
 
-  let referenceData = fs.readFileSync(argv.references, "utf8");
+  let referenceData = fs.readFileSync(options.references, "utf8");
   let referenceRefs = [];
   for (let utxoRef of JSON.parse(referenceData)) {
     referenceRefs.push(
@@ -1541,12 +1898,12 @@ async function autoWithdrawRewards(argv: any) {
   }
   let references: Core.TransactionUnspentOutput[] = [];
   if (referenceRefs.length > 0) {
-    references = await provider.resolveUnspentOutputs(referenceRefs);
+    references = await options.provider.resolveUnspentOutputs(referenceRefs);
   }
 
   let totalWithdrawn = 0n;
 
-  if (argv.forceSubmit) {
+  if (options.forceSubmit) {
     const response = prompt("Do you really want to force submission of all transactions? (yes/no)");
     if (response != "yes") {
       console.log("Aborting");
@@ -1557,38 +1914,38 @@ async function autoWithdrawRewards(argv: any) {
   for (let i = 0; i < todo.length; i++) {
     let thisChange = change[i];
     let targetPool = todo[i].pool.utxo;
-    let options = {
-      blaze: blaze,
-      provider: provider,
+    let withdrawOptions = {
+      blaze: options.blaze,
+      provider: options.provider,
       settings: settings,
       change: thisChange,
       targetPool: todo[i].pool.ident.toString("hex"),
-      signers: argv.signers,
+      signers: options.signers,
       withdrawnAmount: todo[i].amount,
       remainingAmount: undefined,
-      withheldAddress: Core.addressFromBech32(argv.withheldAddress),
+      withheldAddress: options.withheldAddress,
       references: references,
-      blueprint: bp,
-      treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(network))),
-      poolAddress: Core.addressFromBech32(argv.poolAddress),
+      blueprint: options.blueprint,
+      treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(options.provider.network))),
+      poolAddress: Core.addressFromBech32(options.poolAddress),
     };
 
-    if (argv.forceSubmit) {
-      await submitAndAwaitWithRetry(blaze, async () => {
-        const tx = await buildWithdrawPoolRewards(options);
-        await blaze.signTransaction(tx);
+    if (options.forceSubmit) {
+      await submitAndAwaitWithRetry(options.blaze, async () => {
+        const tx = await buildWithdrawPoolRewards(withdrawOptions);
+        await options.blaze.signTransaction(tx);
         return tx;
       });
-    } else if (argv.submit) {
-      const tx = await buildWithdrawPoolRewards(options);
-      await blaze.signTransaction(tx);
+    } else if (options.submit) {
+      const tx = await buildWithdrawPoolRewards(withdrawOptions);
+      await options.blaze.signTransaction(tx);
       const response = prompt("Type 'submit' to submit");
       if (response == "submit") {
-        await blaze.submitTransaction(tx);
+        await options.blaze.submitTransaction(tx);
         console.log("Submitted");
       }
     } else {
-      const tx = await buildWithdrawPoolRewards(options);
+      const tx = await buildWithdrawPoolRewards(withdrawOptions);
       console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
     }
     totalWithdrawn += todo[i].amount;
@@ -1616,9 +1973,13 @@ if (argv.buildUpdateFeeManager) {
 //} else if (argv.withdrawGenericStake) {
 //  await withdrawGenericStake(argv);
 } else if (argv.autoWithdrawRewards) {
-  await autoWithdrawRewards(argv);
+  let { blaze, provider } = await setupBlaze();
+  let opts = makeAutoWithdrawOptions(argv, blaze, provider);
+  await autoWithdrawRewards(opts);
 } else if (argv.testAutoWithdraw) {
   await testAutoWithdraw(argv);
+} else if (argv.doPayouts) {
+  await payouts(argv);
 }
 
 process.exit(0);
