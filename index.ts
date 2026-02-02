@@ -1616,7 +1616,7 @@ async function doPayouts(options: PayoutOptions) {
   let change = await collectChange(
     options.provider,
     options.walletAddress,
-    report.extraPayments.totalPayout + 20_000_000n,
+    report.payments.totalPayout + 20_000_000n,
   );
   let buildPayoutOptions: BuildPayoutOptions = {
     changeUtxos: change,
@@ -1666,7 +1666,7 @@ interface Report {
   feesPaid: FeesPaid,
   totalScoopers: bigint,
   protocolFeesNeeded: bigint,
-  extraPayments: ExtraPayments,
+  payments: ExtraPayments,
 }
 
 type FeesPaid = Map<string, bigint>;
@@ -1698,7 +1698,7 @@ function decodeReportFromJson(json: string): Report {
     feesPaid: new Map(),
     totalScoopers: 0n,
     protocolFeesNeeded: 0n,
-    extraPayments: {
+    payments: {
       sundaeAWSFee: 0n,
       sundaeMiscFee: 0n,
       tokenHoldersFee: 0n,
@@ -1716,35 +1716,35 @@ function decodeReportFromJson(json: string): Report {
   }
   report.totalScoopers = BigInt(obj.totalScoopers);
 
-  if (!obj.extraPayments) {
-    throw new Error("Missing 'extraPayments'");
+  if (!obj.payments) {
+    throw new Error("Missing 'payments'");
   }
-  if (!obj.extraPayments.sundaeAWSFee) {
-    throw new Error("Missing 'extraPayments.sundaeAWSFee'");
+  if (!obj.payments.sundaeAWSFee) {
+    throw new Error("Missing 'payments.sundaeAWSFee'");
   }
-  report.extraPayments.sundaeAWSFee = BigInt(obj.extraPayments.sundaeAWSFee);
-  if (!obj.extraPayments.sundaeMiscFee) {
-    throw new Error("Missing 'extraPayments.sundaeMiscFee'");
+  report.payments.sundaeAWSFee = BigInt(obj.payments.sundaeAWSFee);
+  if (!obj.payments.sundaeMiscFee) {
+    throw new Error("Missing 'payments.sundaeMiscFee'");
   }
-  report.extraPayments.sundaeMiscFee = BigInt(obj.extraPayments.sundaeMiscFee);
-  if (!obj.extraPayments.tokenHoldersFee) {
-    throw new Error("Missing 'extraPayments.tokenHoldersFee'");
+  report.payments.sundaeMiscFee = BigInt(obj.payments.sundaeMiscFee);
+  if (!obj.payments.tokenHoldersFee) {
+    throw new Error("Missing 'payments.tokenHoldersFee'");
   }
-  report.extraPayments.tokenHoldersFee = BigInt(obj.extraPayments.tokenHoldersFee);
-  if (!obj.extraPayments.usdmFundFee) {
-    throw new Error("Missing 'extraPayments.usdmFundFee'");
+  report.payments.tokenHoldersFee = BigInt(obj.payments.tokenHoldersFee);
+  if (!obj.payments.usdmFundFee) {
+    throw new Error("Missing 'payments.usdmFundFee'");
   }
-  report.extraPayments.usdmFundFee = BigInt(obj.extraPayments.usdmFundFee);
+  report.payments.usdmFundFee = BigInt(obj.payments.usdmFundFee);
 
-  if (!obj.extraPayments.flat) {
-    throw new Error("Missing 'extraPayments.flat'");
+  if (!obj.payments.flat) {
+    throw new Error("Missing 'payments.flat'");
   }
-  report.extraPayments.flat = BigInt(obj.extraPayments.flat);
+  report.payments.flat = BigInt(obj.payments.flat);
 
-  if (!obj.extraPayments.totalPayout) {
-    throw new Error("Missing 'extraPayments.totalPayout'");
+  if (!obj.payments.totalPayout) {
+    throw new Error("Missing 'payments.totalPayout'");
   }
-  report.extraPayments.totalPayout = BigInt(obj.extraPayments.totalPayout);
+  report.payments.totalPayout = BigInt(obj.payments.totalPayout);
 
   if (!obj.protocolFeesNeeded) {
     throw new Error("Missing 'protocolFeesNeeded'");
@@ -1768,7 +1768,7 @@ function computePayments(report: Report, addresses: Addresses): Payment[] {
     if (!resolvedAddress) {
       throw new Error(`Couldn't resolve an address for scooper ${scooperName}`);
     }
-    let totalPayment = feesPaid + report.extraPayments.flat;
+    let totalPayment = feesPaid + report.payments.flat;
     payments.push({ address: resolvedAddress, lovelace: totalPayment });
   }
   return payments;
@@ -1807,19 +1807,19 @@ async function payout(options: BuildPayoutOptions) {
   }
   tx.payAssets(
     options.tokenHoldersDestination,
-    new Core.Value(options.report.extraPayments.tokenHoldersFee),
+    new Core.Value(options.report.payments.tokenHoldersFee),
   );
   tx.payAssets(
     options.otherPaymentsDestination,
-    new Core.Value(options.report.extraPayments.sundaeMiscFee),
+    new Core.Value(options.report.payments.sundaeMiscFee),
   );
   tx.payAssets(
     options.otherPaymentsDestination,
-    new Core.Value(options.report.extraPayments.sundaeAWSFee),
+    new Core.Value(options.report.payments.sundaeAWSFee),
   );
   tx.payAssets(
     options.otherPaymentsDestination,
-    new Core.Value(options.report.extraPayments.usdmFundFee),
+    new Core.Value(options.report.payments.usdmFundFee),
   );
 
   // TODO: Attach breakdown metadata
