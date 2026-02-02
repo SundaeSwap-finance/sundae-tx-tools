@@ -308,9 +308,9 @@ export function decodePoolDatum(d: Decoder): PoolDatum {
   let marketOpen = decodeInteger(d);
   let protocolFees = decodeInteger(d);
   decodeBreak(d);
-  console.log(`circulatingLp: ${stringify(circulatingLp)}`);
-  console.log(`bidFees: ${stringify(bidFees)}`);
-  console.log(`askFees: ${stringify(askFees)}`);
+  //console.log(`circulatingLp: ${stringify(circulatingLp)}`);
+  //console.log(`bidFees: ${stringify(bidFees)}`);
+  //console.log(`askFees: ${stringify(askFees)}`);
   return {
     identifier,
     assetPair,
@@ -822,7 +822,6 @@ function encodeMultisig(e: Encoder, multisig: Multisig) {
       encodeMultisig(e, script);
     }
     encodeBreak(e);
-    encodeBreak(e);
   } else if (multisig.tag == "AnyOf") {
     encodeTag8(e, 123n);
     encodeBeginArrayIndefinite(e);
@@ -830,11 +829,11 @@ function encodeMultisig(e: Encoder, multisig: Multisig) {
       encodeMultisig(e, script);
     }
     encodeBreak(e);
-    encodeBreak(e);
   } else if (multisig.tag == "AtLeast") {
     encodeTag8(e, 124n);
     encodeBeginArrayIndefinite(e);
     encodeInteger(e, multisig.required);
+    encodeBeginArrayIndefinite(e);
     for (let script of multisig.scripts) {
       encodeMultisig(e, script);
     }
