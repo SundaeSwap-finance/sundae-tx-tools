@@ -1450,7 +1450,6 @@ async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
     }
   });
 
-
   tx.provideCollateral([options.change]);
 
   let poolManageScript = Script.newPlutusV2Script(
@@ -1459,7 +1458,7 @@ async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
   tx.provideScript(poolManageScript);
 
   console.log(`tx (not completed): ${tx.toCbor()}`);
-  let completed = await tx.complete();
+  let completed = await tx.complete({ useCoinSelection: false });
   return completed;
 }
 
