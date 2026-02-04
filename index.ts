@@ -66,6 +66,14 @@ async function prompt(s: string): Promise<string> {
   return answer;
 }
 
+function envelope(txBytes: string) {
+  return `{
+  "type": "Witnessed Tx ConwayEra",
+  "description": "Ledger Cddl Format",
+  "cborHex": "${txBytes}"
+}`;
+}
+
 function hexEncode(s: string): string {
   return Buffer.from(s, "utf8").toString("hex");
 }
@@ -1650,6 +1658,7 @@ async function doPayouts(options: PayoutOptions) {
     scooperPayments: payments,
     submit: options.submit,
     forceSubmit: options.forceSubmit,
+    addresses: addresses,
   }
   await payout(buildPayoutOptions);
 }
@@ -1818,6 +1827,34 @@ interface BuildPayoutOptions {
   scooperPayments: Payment[],
   submit: boolean | undefined,
   forceSubmit: boolean | undefined,
+  addresses: Addresses,
+}
+
+async function doPayout(argv: any) {
+  let { blaze, provider } = await setupBlaze();
+
+  let address = Core.addressFromBech32(argv.walletAddress);
+
+  let addressesJson = fs.readFileSync(argv.addressesFile, "utf8");
+  let addresses = decodeAddressesFromJson(addressesJson);
+  let reportJson = fs.readFileSync(argv.reportFile, "utf8");
+  let report = decodeReportFromJson(reportJson);
+  let payments = computePayments(report, addresses);
+
+  let utxos = await collectChange(provider, address, report.payments.totalPayout + 20_000_000n);
+
+  let options: BuildPayoutOptions = {
+    blaze: blaze,
+    changeUtxos: utxos,
+    report: report,
+    tokenHoldersDestination: Core.addressFromBech32(argv.tokenHoldersDestination),
+    otherPaymentsDestination: Core.addressFromBech32(argv.otherPaymentsDestination),
+    submit: argv.submit,
+    forceSubmit: argv.forceSubmit,
+    scooperPayments: payments,
+    addresses: addresses,
+  };
+  await payout(options);
 }
 
 async function payout(options: BuildPayoutOptions) {
@@ -1847,7 +1884,40 @@ async function payout(options: BuildPayoutOptions) {
     new Core.Value(options.report.payments.usdmFundFee),
   );
 
-  // TODO: Attach breakdown metadata
+  let timestamp = displayPreviousMonth(new Date());
+
+  let mm = new Map([
+    [
+      "msg", 
+      [
+        `Sundae Revenue ${timestamp}`
+      ]
+    ]
+  ]);
+
+  let mDatum = Core.Metadatum.fromCore(mm);
+
+  let mContents = new Map();
+  mContents.set(674, mDatum);
+
+  let breakdownMeta = new Map();
+  for (const [name, fees] of options.report.feesPaid) {
+    let address = options.addresses.get(name);
+    let paymentCredHash = address.getProps().paymentPart.hash;
+    breakdownMeta.set(
+      fromHex(paymentCredHash),
+      new Map([
+        ["fees", fees],
+        ["rewards", options.report.payments.flat]
+      ]),
+    );
+  }
+  mContents.set(73115, Core.Metadatum.fromCore(breakdownMeta));
+  let m = new Core.Metadata(mContents);
+  let auxData = Core.AuxiliaryData.fromCore({
+    blob: m.toCore(),
+  });
+  tx.setAuxiliaryData(auxData);
 
   tx.useCoinSelector((inputs, dearth) => {
     return {
@@ -1874,7 +1944,8 @@ async function payout(options: BuildPayoutOptions) {
       console.log("Submitted");
     }
   } else {
-    console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
+    let completed = await tx.complete();
+    console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
   }
 }
 
@@ -2058,6 +2129,8 @@ if (argv.buildUpdateFeeManager) {
   await testAutoWithdraw(argv);
 } else if (argv.doPayouts) {
   await payouts(argv);
+} else if (argv.doPayout) {
+  await doPayout(argv);
 } else if (argv.makeChangeUtxos) {
   await makeChangeUtxos(argv);
 }
