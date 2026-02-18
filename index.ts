@@ -5,6 +5,7 @@ import * as readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import {
   Address,
+  CborSet,
   Datum,
   DatumKind,
   Ed25519PrivateNormalKeyHex,
@@ -19,7 +20,10 @@ import {
   Transaction,
   TransactionId,
   TransactionInput,
+  TransactionWitnessSet,
   Value,
+  VkeyWitness,
+  signMessage as blazeSignMessage,
 } from "@blaze-cardano/core";
 import { ColdWallet, HotSingleWallet, Core, Blaze, Blockfrost, Provider, Wallet } from "@blaze-cardano/sdk";
 import { TxBuilder } from "@blaze-cardano/tx";
@@ -1857,6 +1861,80 @@ async function doPayout(argv: any) {
   await payout(options);
 }
 
+interface BuildWithdrawGenericStake {
+  blaze: Blaze<Wallet, Provider>,
+  change: Core.TransactionUnspentOutput,
+  stakeAddress: Address,
+  withdrawnAmount: bigint,
+  submit: boolean,
+  forceSubmit: boolean,
+  stakeKey: string,
+}
+
+async function withdrawGenericStake(argv: any) {
+  let { blaze, provider } = await setupBlaze();
+  let address = Core.addressFromBech32(argv.walletAddress);
+  let change = await findChange(provider, address, 1000000n);
+  let options: BuildWithdrawGenericStake = {
+    blaze: blaze,
+    change: change,
+    stakeAddress: Core.addressFromBech32(argv.stakeAddress),
+    withdrawnAmount: BigInt(argv.withdrawnAmount), // TODO: We should be able to query this
+    submit: argv.submit,
+    forceSubmit: argv.forceSubmit,
+    stakeKey: argv.stakeKey,
+  };
+  await buildWithdrawGenericStake(options);
+}
+
+async function signWithStakeKey(tx: Transaction, key: Ed25519PrivateKey) {
+  const sig = blazeSignMessage(HexBlob(tx.getId()), key.hex());
+  console.log("sig");
+  console.log(sig);
+  const stakePublicKey = await key.toPublic();
+  const stakeVkw = new VkeyWitness(stakePublicKey.hex(), sig);
+  const vkeys = [stakeVkw.toCore()];
+  let tws = new TransactionWitnessSet();
+  tws.setVkeys(CborSet.fromCore(vkeys, VkeyWitness.fromCore));
+  tx.setWitnessSet(tws);
+}
+
+async function buildWithdrawGenericStake(options: BuildWithdrawGenericStakeOptions) {
+  const tx = options.blaze.newTransaction();
+
+  tx.addInput(options.change);
+
+  tx.addWithdrawal(
+    options.stakeAddress.toBech32(),
+    options.withdrawnAmount,
+  );
+
+  const stakeKey = Core.Ed25519PrivateKey.fromNormalHex(options.stakeKey);
+
+  if (options.forceSubmit) {
+    let completed = await tx.complete({ useCoinSelection: false });
+    await signWithStakeKey(completed, stakeKey);
+    await options.blaze.signTransaction(completed);
+    await options.blaze.submitTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    console.log("Submitted");
+  } else if (options.submit) {
+    let completed = await tx.complete({ useCoinSelection: false });
+    await signWithStakeKey(completed, stakeKey);
+    await options.blaze.signTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    const response = await prompt("Type 'submit' to submit");
+    if (response == "submit") {
+      await options.blaze.submitTransaction(completed);
+      console.log("Submitted");
+    }
+  } else {
+    let completed = await tx.complete({ useCoinSelection: false });
+    await signWithStakeKey(completed, stakeKey);
+    console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
+  }
+}
+
 async function payout(options: BuildPayoutOptions) {
   const tx = options.blaze.newTransaction();
 
@@ -2133,6 +2211,8 @@ if (argv.buildUpdateFeeManager) {
   await doPayout(argv);
 } else if (argv.makeChangeUtxos) {
   await makeChangeUtxos(argv);
+} else if (argv.withdrawGenericStake) {
+  await withdrawGenericStake(argv);
 }
 
 process.exit(0);
