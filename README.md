@@ -86,3 +86,9 @@ node index.js \
   --blueprint mainnet.blueprint.json \
   --treasuryAddress addr1w8qd02ncr520yph37erg7z3dfyv8684uhr6eckwht5xz0fc6vn2tg
 ```
+
+To dry-run end-to-end payout script:
+
+```
+bun index.ts --doPayouts --reportFile report.json --txLogDir txLog --mainnet --payoutConfig payout-config.json
+```
