@@ -1,6 +1,8 @@
+
 import * as rl from "node:readline/promises";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import { mkdir } from "node:fs/promises";
 import * as readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import {
@@ -1697,6 +1699,8 @@ async function payouts(argv: any) {
 }
 
 async function doPayouts(options: PayoutOptions) {
+  await mkdir(options.txLogDir, { recursive: true });
+
   let addressesJson = fs.readFileSync(options.addressesFile, "utf8");
   let addresses = decodeAddressesFromJson(addressesJson);
   let reportJson = fs.readFileSync(options.reportFile, "utf8");
@@ -1800,6 +1804,7 @@ async function doPayouts(options: PayoutOptions) {
     submit: options.submit,
     forceSubmit: options.forceSubmit,
     addresses: addresses,
+    txLogDir: options.txLogDir,
   }
 
   console.log("building payout tx");
@@ -1974,6 +1979,7 @@ interface BuildPayoutOptions {
   submit: boolean | undefined,
   forceSubmit: boolean | undefined,
   addresses: Addresses,
+  txLogDir: string,
 }
 
 async function doPayout(argv: any) {
@@ -2000,6 +2006,7 @@ async function doPayout(argv: any) {
     forceSubmit: argv.forceSubmit,
     scooperPayments: payments,
     addresses: addresses,
+    txLogDir: argv.txLogDir,
   };
   await payout(dryLedger, options);
 }
@@ -2131,9 +2138,11 @@ async function buildWithdrawGenericStake(dryLedger: DryLedger, options: BuildWit
     }
   } else {
     let completed = await tx.complete({ useCoinSelection: false });
-    let txid = completed.getId();
     dryLedger.update(completed);
-    fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-generic-stake.tx`, tx.toCbor());
+    if (options.txLogDir) {
+      let txid = completed.getId();
+      fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-generic-stake.tx`, tx.toCbor());
+    }
     console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
   }
 }
@@ -2229,8 +2238,10 @@ async function buildWithdrawPoolStakeRewards(dryLedger: DryLedger, options: Buil
     }
   } else {
     let completed = await tx.complete({ useCoinSelection: false });
-    let txid = completed.getId();
-    fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-sundae-stake.tx`, tx.toCbor());
+    if (options.txLogDir) {
+      let txid = completed.getId();
+      fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-sundae-stake.tx`, tx.toCbor());
+    }
     console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
   }
 }
@@ -2327,6 +2338,10 @@ async function payout(dryLedger: DryLedger, options: BuildPayoutOptions) {
   } else {
     console.log(`payout pre-complete: ${tx.toCbor()}`);
     let completed = await tx.complete({ useCoinSelection: false });
+    if (options.txLogDir) {
+      let txid = completed.getId();
+      fs.writeFileSync(`${options.txLogDir}/${txid}-payout.tx`, tx.toCbor());
+    }
     console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
   }
 }
@@ -2545,9 +2560,11 @@ async function autoWithdrawRewards(dryLedger: DryLedger, options: AutoWithdrawOp
       }
     } else {
       const tx = await buildWithdrawPoolRewards(dryLedger, withdrawOptions);
-      let txid = tx.getId();
       console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
-      fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-protocol-fees-${i}.tx`, tx.toCbor());
+      if (options.txLogDir) {
+        let txid = tx.getId();
+        fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-protocol-fees-${i}.tx`, tx.toCbor());
+      }
     }
     totalWithdrawn += todo[i].amount;
     console.log(`Total withdrawn so far: ${totalWithdrawn}`);
