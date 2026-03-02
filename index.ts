@@ -300,7 +300,7 @@ function decodeBlueprint(blueprint: string): Blueprint {
 }
 
 async function buildUpdateFeeManager(args: any): Promise<Core.Transaction> {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(args);
 
   let bp = decodeBlueprint(fs.readFileSync(args.blueprint, "utf8"));
   let poolAddress = Core.addressFromBech32(args.poolAddress);
@@ -552,7 +552,7 @@ async function makeRedeemer(argv: any) {
 }
 
 async function updateFeeManager(argv: any) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(argv);
   let completed = await buildUpdateFeeManager(argv);
   if (argv.submit) {
     let signed = await blaze.signTransaction(completed);
@@ -571,7 +571,7 @@ async function updateFeeManager(argv: any) {
 }
 
 async function updatePoolStakeCredential(args: any, pool: Core.TransactionUnspentOutput, change: Core.TransactionUnspentOutput) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(args);
   let bp = decodeBlueprint(fs.readFileSync(args.blueprint, "utf8"));
   let poolAddress = pool.output().address();
 
@@ -693,7 +693,7 @@ async function updatePoolStakeCredential(args: any, pool: Core.TransactionUnspen
 }
 
 async function updateSinglePoolStakeCredential(argv: any) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(argv);
   let address = Core.addressFromBech32(argv.address);
   let poolAddress = Core.addressFromBech32(argv.poolAddress);
 
@@ -1214,7 +1214,7 @@ async function debugConditionedScoop(argv: any) {
 }
 
 async function registerStakeAddress(argv: any) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(argv);
   let address = Core.addressFromBech32(argv.address);
 
   const cred = {
@@ -1268,7 +1268,7 @@ async function registerStakeAddress(argv: any) {
 }
 
 async function updateAllPoolStakeCredentials(argv: any) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(argv);
   let address = Core.addressFromBech32(argv.address);
   let knownPools = await provider.getUnspentOutputs(Core.addressFromBech32(argv.poolAddress));
   let valid = 0n;
@@ -1580,14 +1580,28 @@ async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, buildTx: 
   }
 }
 
-async function setupBlaze(): Promise<{ blaze: Blaze<Provider, Wallet>, provider: Provider }> {
+function readSigningKeyFile(filepath: string): string {
+  let contents = fs.readFileSync(filepath, "utf8");
+  let json = JSON.parse(contents) as { cborHex: string };
+  let skeyCbor = json.cborHex;
+  if (skeyCbor.startsWith("5820")) {
+    let skeyHex = skeyCbor.slice(4);
+    return skeyHex;
+  } else {
+    throw new Error("readSigningKeyFile: invalid cbor signing key");
+  }
+}
+
+async function setupBlaze(args: any): Promise<{ blaze: Blaze<Provider, Wallet>, provider: Provider }> {
+  let isMainnet = args.mainnet || false;
+  let skeyFilePath = args.skeyFile;
   const projectId = process.env["BLOCKFROST_PROJECT_ID"];
   if (!projectId) {
     throw new Error("Missing blockfrost key");
   }
 
   let provider: Provider;
-  if (process.env["MAINNET"]) {
+  if (isMainnet) {
     provider = new Blockfrost({
       network: "cardano-mainnet",
       projectId,
@@ -1600,18 +1614,18 @@ async function setupBlaze(): Promise<{ blaze: Blaze<Provider, Wallet>, provider:
   }
 
   let network: NetworkId;
-  if (process.env["MAINNET"]) {
+  if (isMainnet) {
     network = NetworkId.Mainnet;
   } else {
     network = NetworkId.Testnet;
   }
 
-  const skeyHex = process.env["SKEY_HEX"];
   let wallet: Wallet;
-  if (skeyHex) {
+  if (skeyFilePath) {
+    let skeyHex = readSigningKeyFile(skeyFilePath);
     wallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, provider);
   } else {
-    wallet = new ColdWallet(Core.addressFromBech32(argv.walletAddress), network, provider);
+    wallet = new ColdWallet(Core.addressFromBech32(args.walletAddress), network, provider);
   }
 
   let blaze = await Blaze.from(provider, wallet);
@@ -1634,42 +1648,51 @@ interface PayoutOptions {
   withheldAddress: Address,
   submit: boolean | undefined,
   forceSubmit: boolean | undefined,
-  signers: string,
+  protocolFeesSigners: string,
   tokenHoldersDestination: Address,
   otherPaymentsDestination: Address,
   txLogDir: string,
   genericStakeAddress: Address,
   sundaePoolStakeAddress: Address,
-  genericStakeKey: string,
+  genericStakeKeyFile: string,
   treasuryAddress: Address,
   sundaeStakingSigner: string,
 }
 
-async function payouts(argv: any) {
-  let { blaze, provider } = await setupBlaze();
-  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint as string, "utf8"));
-  let payoutOptions: PayoutOptions = {
-    addressesFile: argv.addressesFile as string,
+function makePayoutOptions(argv: any, config: any, blaze: Blaze<Provider, Wallet>, provider: Provider, bp: Blueprint): PayoutOptions {
+  return {
+    addressesFile: config.addressesFile as string,
     reportFile: argv.reportFile as string,
-    poolAddress: argv.poolAddress as string,
+    poolAddress: config.poolAddress as string,
     blaze: blaze,
     provider: provider,
-    walletAddress: Core.addressFromBech32(argv.walletAddress as string),
-    references: argv.references as string,
+    walletAddress: Core.addressFromBech32(config.walletAddress as string),
+    references: config.referencesFile as string,
     blueprint: bp,
-    withheldAddress: Core.addressFromBech32(argv.withheldAddress as string),
+    withheldAddress: Core.addressFromBech32(config.withheldAddress as string),
     submit: argv.submit,
     forceSubmit: argv.forceSubmit,
-    signers: argv.signers as string,
-    tokenHoldersDestination: Core.addressFromBech32(argv.tokenHoldersDestination as string),
-    otherPaymentsDestination: Core.addressFromBech32(argv.otherPaymentsDestination as string),
-    txLogDir: argv.txLogDir,
-    genericStakeAddress: Core.addressFromBech32(argv.genericStakeAddress as string),
-    sundaePoolStakeAddress: Core.addressFromBech32(argv.sundaePoolStakeAddress as string),
-    genericStakeKey: argv.genericStakeKey as string,
-    treasuryAddress: Core.addressFromBech32(argv.treasuryAddress as string),
-    sundaeStakingSigner: argv.sundaeStakingSigner as string,
+    protocolFeesSigners: config.protocolFeesSigners as string,
+    tokenHoldersDestination: Core.addressFromBech32(config.tokenHoldersDestination as string),
+    otherPaymentsDestination: Core.addressFromBech32(config.otherPaymentsDestination as string),
+    txLogDir: config.txLogDir,
+    genericStakeAddress: Core.addressFromBech32(config.genericStakeAddress as string),
+    sundaePoolStakeAddress: Core.addressFromBech32(config.sundaePoolStakeAddress as string),
+    genericStakeKeyFile: config.genericStakeKeyFile as string,
+    treasuryAddress: Core.addressFromBech32(config.treasuryAddress as string),
+    sundaeStakingSigner: config.sundaeStakingSigner as string,
   };
+}
+
+async function payouts(argv: any) {
+  let config = JSON.parse(fs.readFileSync(argv.payoutConfig, "utf8"));
+  let bp = decodeBlueprint(fs.readFileSync(config.blueprint as string, "utf8"));
+  let { blaze, provider } = await setupBlaze({
+    mainnet: argv.mainnet,
+    skeyFile: argv.skeyFile,
+    walletAddress: config.walletAddress,
+  });
+  let payoutOptions = makePayoutOptions(argv, config, blaze, provider, bp);
   await doPayouts(payoutOptions);
 }
 
@@ -1704,7 +1727,7 @@ async function doPayouts(options: PayoutOptions) {
     withdrawnAmount: withdrawableGeneric,
     submit: options.submit || false,
     forceSubmit: options.forceSubmit || false,
-    stakeKey: options.genericStakeKey,
+    stakeKeyFile: options.genericStakeKeyFile,
     txLogDir: options.txLogDir,
   };
   await buildWithdrawGenericStake(withdrawGenericOptions);
@@ -1753,7 +1776,7 @@ async function doPayouts(options: PayoutOptions) {
     submit: options.submit || false,
     forceSubmit: options.forceSubmit || false,
     withheldAddress: options.withheldAddress,
-    signers: options.signers,
+    signers: options.protocolFeesSigners,
     txLogDir: options.txLogDir,
   };
   
@@ -1954,7 +1977,7 @@ interface BuildPayoutOptions {
 }
 
 async function doPayout(argv: any) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(argv);
 
   let address = Core.addressFromBech32(argv.walletAddress);
 
@@ -1988,7 +2011,7 @@ interface BuildWithdrawGenericStake {
   withdrawnAmount: bigint,
   submit: boolean,
   forceSubmit: boolean,
-  stakeKey: string,
+  stakeKeyFile: string,
   txLogDir: string,
 }
 
@@ -2008,7 +2031,7 @@ interface BuildWithdrawPoolStakeRewards {
 }
 
 async function withdrawGenericStake(argv: any) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(argv);
   let withdrawable = null;
   if (argv.fetchRewardsAvailable) {
     withdrawable = await queryRewards(!!argv.mainnet, argv.stakeAddress);
@@ -2022,14 +2045,14 @@ async function withdrawGenericStake(argv: any) {
     withdrawnAmount: withdrawable || BigInt(argv.withdrawnAmount),
     submit: argv.submit,
     forceSubmit: argv.forceSubmit,
-    stakeKey: argv.stakeKey,
+    stakeKeyFile: argv.stakeKeyFile,
     txLogDir: argv.txLogDir,
   };
   await buildWithdrawGenericStake(options);
 }
 
 async function withdrawPoolStakeRewards(argv: any) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(argv);
   let withdrawable = null;
   if (argv.fetchRewardsAvailable) {
     withdrawable = await queryRewards(!!argv.mainnet, argv.stakeAddress);
@@ -2077,7 +2100,8 @@ async function buildWithdrawGenericStake(options: BuildWithdrawGenericStake) {
     options.withdrawnAmount,
   );
 
-  const stakeKey = Core.Ed25519PrivateKey.fromNormalHex(Ed25519PrivateNormalKeyHex(options.stakeKey));
+  let stakeKeyHex = fs.readFileSync(options.stakeKeyFile, "utf8");
+  const stakeKey = Core.Ed25519PrivateKey.fromNormalHex(Ed25519PrivateNormalKeyHex(stakeKeyHex));
 
   if (options.forceSubmit) {
     let completed = await tx.complete({ useCoinSelection: false });
@@ -2353,7 +2377,7 @@ class DryLedger {
 }
 
 async function makeChangeUtxos(argv: any) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(argv);
   const tx = blaze.newTransaction();
 
   let count = BigInt(argv.count);
@@ -2490,13 +2514,24 @@ async function autoWithdrawRewards(dryLedger: DryLedger, options: AutoWithdrawOp
         return tx;
       });
     } else if (options.submit) {
-      const tx = await buildWithdrawPoolRewards(dryLedger, withdrawOptions);
-      await options.blaze.signTransaction(tx);
-      console.log(`${tx.toCbor()}`);
-      const response = await prompt("Type 'submit' to submit");
-      if (response == "submit") {
-        await options.blaze.submitTransaction(tx);
-        console.log("Submitted");
+      let retry = true;
+      while (retry) {
+        const tx = await buildWithdrawPoolRewards(dryLedger, withdrawOptions);
+        await options.blaze.signTransaction(tx);
+        console.log(`${tx.toCbor()}`);
+        const response = await prompt("Type 'submit' to submit");
+        if (response == "submit") {
+          try {
+            let submittedId = await options.blaze.submitTransaction(tx);
+            console.log(`Submitted ${submittedId}`);
+            retry = false;
+          } catch (error) {
+            console.log(error);
+          }
+        } else {
+          console.log("Aborting auto-withdrawal");
+          process.exit(0);
+        }
       }
     } else {
       const tx = await buildWithdrawPoolRewards(dryLedger, withdrawOptions);
@@ -2527,7 +2562,7 @@ if (argv.buildUpdateFeeManager) {
 } else if (argv.debugConditionedScoop) {
   await debugConditionedScoop(argv);
 } else if (argv.autoWithdrawRewards) {
-  let { blaze, provider } = await setupBlaze();
+  let { blaze, provider } = await setupBlaze(argv);
   let opts = makeAutoWithdrawOptions(argv, blaze, provider);
   let dryLedger = new DryLedger();
   await autoWithdrawRewards(dryLedger, opts);
