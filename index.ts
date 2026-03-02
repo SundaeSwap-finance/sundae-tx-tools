@@ -1730,7 +1730,7 @@ async function doPayouts(options: PayoutOptions) {
     stakeKeyFile: options.genericStakeKeyFile,
     txLogDir: options.txLogDir,
   };
-  await buildWithdrawGenericStake(withdrawGenericOptions);
+  await buildWithdrawGenericStake(dryLedger, withdrawGenericOptions);
 
   console.log(`withdraw sundae pool staking rewards for ${options.sundaePoolStakeAddress.toBech32()}`);
 
@@ -2090,15 +2090,21 @@ async function signWithStakeKey(tx: Transaction, key: Ed25519PrivateKey) {
   tx.setWitnessSet(tws);
 }
 
-async function buildWithdrawGenericStake(options: BuildWithdrawGenericStake) {
+async function buildWithdrawGenericStake(dryLedger: DryLedger, options: BuildWithdrawGenericStake) {
+  console.log("buildWithdrawGenericStake 0");
   const tx = options.blaze.newTransaction();
 
+  console.log("buildWithdrawGenericStake 1");
   tx.addInput(options.change);
+  
+  console.log("buildWithdrawGenericStake 2");
 
   tx.addWithdrawal(
     options.stakeAddress.toBech32() as Core.RewardAccount,
-    options.withdrawnAmount,
+    options.withdrawnAmount + 1000_000_000n,
   );
+
+  console.log("buildWithdrawGenericStake 3");
 
   let stakeKeyHex = fs.readFileSync(options.stakeKeyFile, "utf8");
   const stakeKey = Core.Ed25519PrivateKey.fromNormalHex(Ed25519PrivateNormalKeyHex(stakeKeyHex));
@@ -2111,8 +2117,11 @@ async function buildWithdrawGenericStake(options: BuildWithdrawGenericStake) {
     console.log(`${completed.toCbor()}`);
     console.log("Submitted");
   } else if (options.submit) {
+    console.log("buildWithdrawGenericStake 4");
     let completed = await tx.complete({ useCoinSelection: false });
+    console.log("buildWithdrawGenericStake 5");
     await signWithStakeKey(completed, stakeKey);
+    console.log("buildWithdrawGenericStake 6");
     await options.blaze.signTransaction(completed);
     console.log(`${completed.toCbor()}`);
     const response = await prompt("Type 'submit' to submit");
@@ -2123,6 +2132,7 @@ async function buildWithdrawGenericStake(options: BuildWithdrawGenericStake) {
   } else {
     let completed = await tx.complete({ useCoinSelection: false });
     let txid = completed.getId();
+    dryLedger.update(completed);
     fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-generic-stake.tx`, tx.toCbor());
     console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
   }
