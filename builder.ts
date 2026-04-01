@@ -66,11 +66,11 @@ import {
   StablePoolDatum,
   SettingsDatum,
   AssetPair,
-} from "./codec.js";
+} from "./codec.ts";
 import {
   fromHex,
   stringify,
-} from "./util.js";
+} from "./util.ts";
 
 import { EContractVersion, QueryProviderSundaeSwap, SundaeSDK } from "@sundaeswap/core";
 

@@ -6,7 +6,7 @@ import {
 import {
   fromHex,
   stringify,
-} from "./util.js";
+} from "./util.ts";
 
 class Decoder {
   public bytes: Buffer;
