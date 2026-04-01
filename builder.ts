@@ -335,7 +335,7 @@ async function paySelf(blaze: Blaze<Provider, Wallet>, provider: Provider, walle
   const tx = blaze.newTransaction();
 
   for (const input of inputs) {
-    tx.addChainedInput(input);
+    tx.addInput(input);
   }
 
   tx.useCoinSelector((inputs, dearth) => {
@@ -1612,7 +1612,7 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
 
   const tx = options.blaze
     .newTransaction()
-    .addChainedInput(options.change)
+    .addInput(options.change)
     .addInput(targetPool, PlutusData.fromCbor(poolSpendRedeemer));
 
   for (let ref of options.references) {
@@ -1827,7 +1827,7 @@ async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
 
   const tx = options.blaze
     .newTransaction()
-    .addChainedInput(options.change)
+    .addInput(options.change)
     .addInput(targetPool, PlutusData.fromCbor(poolSpendRedeemer));
 
   for (let ref of options.references) {
@@ -2525,7 +2525,7 @@ async function signWithStakeKey(tx: Transaction, key: Ed25519PrivateKey) {
 async function buildWithdrawGenericStake(options: BuildWithdrawGenericStake) {
   const tx = options.blaze.newTransaction();
 
-  tx.addChainedInput(options.change);
+  tx.addInput(options.change);
   
   tx.addWithdrawal(
     options.stakeAddress.toBech32() as Core.RewardAccount,
@@ -2568,7 +2568,7 @@ async function buildWithdrawGenericStake(options: BuildWithdrawGenericStake) {
 async function buildWithdrawPoolStakeRewards(options: BuildWithdrawPoolStakeRewards) {
   const tx = options.blaze.newTransaction();
 
-  tx.addChainedInput(options.change);
+  tx.addInput(options.change);
 
   let poolStakeRedeemer = HexBlob("00");
   tx.addWithdrawal(options.stakeAddress.toBech32() as Core.RewardAccount, options.withdrawnAmount, PlutusData.fromCbor(poolStakeRedeemer));
@@ -2671,7 +2671,7 @@ async function payout(options: BuildPayoutOptions) {
   const tx = options.blaze.newTransaction();
 
   for (const change of options.changeUtxos) {
-    tx.addChainedInput(change);
+    tx.addInput(change);
   }
 
   for (const payment of options.scooperPayments) {
