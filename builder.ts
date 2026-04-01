@@ -408,25 +408,25 @@ export function decodeBlueprint(blueprint: string): Blueprint {
   let bp: any = {};
   let o = JSON.parse(blueprint);
   for (let v of o.validators) {
-    if (v.title == "settings.spend") {
+    if (v.title.endsWith("settings.spend")) {
       bp.settingsSpend = {
         hash: v.hash,
         validator: v.compiledCode,
       };
     }
-    if (v.title == "pool.spend") {
+    if (v.title.endsWith("pool.spend")) {
       bp.poolSpend = {
         hash: v.hash,
         validator: v.compiledCode,
       };
     }
-    if (v.title == "pool.manage") {
+    if (v.title.endsWith("pool.manage") || v.title.endsWith("pool.manage.else")) {
       bp.poolManage = {
         hash: v.hash,
         validator: v.compiledCode,
       };
     }
-    if (v.title == "pool_stake.stake") {
+    if (v.title.endsWith("pool_stake.stake") || v.title.endsWith("pool_stake.else")) {
       bp.poolStake = {
         hash: v.hash,
         validator: v.compiledCode,
