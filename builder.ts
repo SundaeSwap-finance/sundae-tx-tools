@@ -74,6 +74,18 @@ import {
 
 import { EContractVersion, QueryProviderSundaeSwap, SundaeSDK } from "@sundaeswap/core";
 
+function valueIsZero(v: Value) {
+  let coreValue = v.toCore();
+  if (coreValue.assets) {
+    for (let [assetId, amount] of coreValue.assets) {
+      if (amount != 0n) {
+        return false;
+      }
+    }
+  }
+  return coreValue.coins == 0n;
+}
+
 async function queryRewards(mainnet: boolean, stakeAddress: string): Promise<bigint | undefined> {
   const projectId = process.env["BLOCKFROST_PROJECT_ID"];
   let queryString = "";
@@ -1702,7 +1714,7 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   withheldAmountMa.set(coinB, withheldB);
   withheldAmount.setMultiasset(withheldAmountMa);
 
-  if (withheldAmount.nonzero()) {
+  if (!valueIsZero(withheldAmount)) {
     tx.payAssets(
       options.withheldAddress,
       withheldAmount
