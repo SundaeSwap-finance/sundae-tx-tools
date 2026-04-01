@@ -41,6 +41,7 @@ import {
   decodeNewFeeManager,
   decodePoolDatum,
   decodeSettingsDatum,
+  decodeStablePoolDatum,
   encoder,
   withEncoder,
   withEncoderHex,
@@ -51,6 +52,11 @@ import {
   encodeNewFees,
   encodeNewFeeManager,
   encodeSettingsDatum,
+  encodeStablePoolDatum,
+  encodeStablePoolManageRedeemer,
+  encodeStablePoolSpendRedeemer,
+  assetClassIsAda,
+  assetClassToAssetId,
   newAddress,
   MultisigSignature,
   Address as CodecAddress,
@@ -59,6 +65,7 @@ import {
   ConvenienceFeeManagerRedeemerUpdateFee,
   ConvenienceFeeManagerRedeemerUpdateFeeManager,
   PoolDatum,
+  StablePoolDatum,
   SettingsDatum,
   AssetPair,
 } from "./codec.js";
@@ -152,6 +159,36 @@ async function findPoolByIdent(provider: Provider, poolAddress: Core.Address, po
   }
   if (!pool) {
     throw new Error(`Couldn't find pool with ident: ${poolIdent}`);
+  }
+  return pool;
+}
+
+export async function findStablePoolByIdent(provider: Provider, poolAddress: Core.Address, poolIdent: string): Promise<Core.TransactionUnspentOutput> {
+  let pool = null;
+  let poolPolicy = poolAddress.getProps().paymentPart?.hash;
+  if (!poolPolicy) {
+    throw new Error("Couldn't get pool policy");
+  }
+  let poolNft = poolPolicy + "000de140" + poolIdent;
+  let poolNftAssetId = Core.AssetId(poolNft);
+  let knownPool = await provider.getUnspentOutputByNFT(poolNftAssetId);
+  if (knownPool) {
+    let datum = knownPool.output().datum();
+    if (!datum) {
+      throw new Error("invalid datum");
+    }
+    let datumInline = datum.asInlineData();
+    if (!datumInline) {
+      throw new Error("expected inline datum on stable pool");
+    }
+    let datumCbor = datumInline.toCbor();
+    let pd = decodeStablePoolDatum(decoder(fromHex(datumCbor)));
+    if (pd.identifier.toString('hex') == poolIdent) {
+      pool = knownPool;
+    }
+  }
+  if (!pool) {
+    throw new Error(`Couldn't find stable pool with ident: ${poolIdent}`);
   }
   return pool;
 }
@@ -357,19 +394,19 @@ function compareUtxo(a: Core.TransactionUnspentOutput, b: Core.TransactionUnspen
   }
 }
 
-interface BlueprintScript {
+export interface BlueprintScript {
   hash: string,
   validator: string,
 }
 
-interface Blueprint {
+export interface Blueprint {
   settingsSpend: BlueprintScript,
   poolSpend: BlueprintScript,
   poolManage: BlueprintScript,
   poolStake: BlueprintScript,
 }
 
-function decodeBlueprint(blueprint: string): Blueprint {
+export function decodeBlueprint(blueprint: string): Blueprint {
   let bp: any = {};
   let o = JSON.parse(blueprint);
   for (let v of o.validators) {
@@ -1428,6 +1465,266 @@ async function updateAllPoolStakeCredentials(argv: any) {
   }
 }
 
+interface BuildWithdrawStablePoolRewards {
+  blaze: Blaze<Provider, Wallet>,
+  provider: Provider,
+  settings: Core.TransactionUnspentOutput,
+  change: Core.TransactionUnspentOutput,
+  targetPool: string,
+  signers: string,
+  withdrawnAmountFlat: bigint,
+  withdrawnAmountA: bigint,
+  withdrawnAmountB: bigint,
+  remainingAmountFlat: bigint | undefined,
+  remainingAmountA: bigint | undefined,
+  remainingAmountB: bigint | undefined,
+  withheldAddress: Address,
+  references: Core.TransactionUnspentOutput[],
+  blueprint: Blueprint,
+  treasuryAddress: Address,
+  poolAddress: Address,
+  allowance: { numerator: bigint, denominator: bigint } | undefined,
+  treasuryAmountFlat: bigint | undefined,
+  treasuryAmountA: bigint | undefined,
+  treasuryAmountB: bigint | undefined,
+  txLogDir: string,
+}
+
+export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStablePoolRewards) {
+  let targetPool = await findStablePoolByIdent(options.provider, options.poolAddress, options.targetPool);
+  if (!targetPool) {
+    throw new Error(`Couldn't find pool utxo with target ident ${options.targetPool}`);
+  }
+  let targetPoolDatum = targetPool.output().datum();
+  if (!targetPoolDatum) {
+    throw new Error(`Missing datum on target pool`);
+  }
+  let targetPoolDatumInline = targetPoolDatum.asInlineData();
+  if (!targetPoolDatumInline) {
+    throw new Error(`Missing inline datum on target pool`);
+  }
+  let datumCbor = targetPoolDatumInline.toCbor();
+  //console.log(`pool datum: ${datumCbor}`);
+  let newPoolDatum = decodeStablePoolDatum(decoder(fromHex(datumCbor)));
+  //console.log(`decoded pool datum: ${stringify(newPoolDatum)}`);
+  let withdrawnAmountFlat;
+  if (options.withdrawnAmountFlat != undefined) {
+    withdrawnAmountFlat = BigInt(options.withdrawnAmountFlat);
+    newPoolDatum.protocolFees[0] = newPoolDatum.protocolFees[0] - withdrawnAmountFlat;
+  } else if (options.remainingAmountFlat != undefined) {
+    let remainingPoolFees = BigInt(options.remainingAmountFlat);
+    withdrawnAmountFlat = newPoolDatum.protocolFees[0] - remainingPoolFees;
+    newPoolDatum.protocolFees[0] = remainingPoolFees;
+  } else {
+    throw new Error("must pass either withdrawnAmount or remainingAmount");
+  }
+  let withdrawnAmountA;
+  if (options.withdrawnAmountA != undefined) {
+    withdrawnAmountA = BigInt(options.withdrawnAmountA);
+    newPoolDatum.protocolFees[1] = newPoolDatum.protocolFees[1] - withdrawnAmountA;
+  } else if (options.remainingAmountA != undefined) {
+    let remainingPoolFees = BigInt(options.remainingAmountA);
+    withdrawnAmountA = newPoolDatum.protocolFees[1] - remainingPoolFees;
+    newPoolDatum.protocolFees[1] = remainingPoolFees;
+  } else {
+    throw new Error("must pass either withdrawnAmount or remainingAmount");
+  }
+  let withdrawnAmountB;
+  if (options.withdrawnAmountB != undefined) {
+    withdrawnAmountB = BigInt(options.withdrawnAmountB);
+    newPoolDatum.protocolFees[2] = newPoolDatum.protocolFees[2] - withdrawnAmountB;
+  } else if (options.remainingAmountB != undefined) {
+    let remainingPoolFees = BigInt(options.remainingAmountB);
+    withdrawnAmountB = newPoolDatum.protocolFees[2] - remainingPoolFees;
+    newPoolDatum.protocolFees[2] = remainingPoolFees;
+  } else {
+    throw new Error("must pass either withdrawnAmount or remainingAmount");
+  }
+
+  let toSpend = [];
+  toSpend.push(options.change);
+  toSpend.push(targetPool);
+  toSpend.sort((a, b) => a.input().transactionId() == b.input().transactionId() ? Number(a.input().index() - b.input().index()) : (a.input().transactionId() < b.input().transactionId() ? -1 : 1));
+  let poolInputIndex = 0n;
+  for (let e of toSpend) {
+    if (e.output().address() == targetPool.output().address()) {
+      break;
+    }
+    poolInputIndex = poolInputIndex + 1n;
+  }
+
+  let treasuryAmountFlat = 0n;
+  let treasuryAmountA = 0n;
+  let treasuryAmountB = 0n;
+  let withheldFlat = 0n;
+  let withheldA = 0n;
+  let withheldB = 0n;
+
+  if (options.allowance) {
+    let n = options.allowance.denominator - options.allowance.numerator;
+    let d = options.allowance.denominator;
+    treasuryAmountFlat = n * withdrawnAmountFlat / d + 1n;
+    treasuryAmountA = n * withdrawnAmountA / d + 1n;
+    treasuryAmountB = n * withdrawnAmountB / d + 1n;
+    if (treasuryAmountFlat < 1000000n) {
+      treasuryAmountFlat = 1000000n;
+    }
+    if (treasuryAmountA < 1000000n) {
+      treasuryAmountA = 1000000n;
+    }
+    if (treasuryAmountB < 1000000n) {
+      treasuryAmountB = 1000000n;
+    }
+    withheldFlat = withdrawnAmountFlat - treasuryAmountFlat;
+    withheldA = withdrawnAmountA - treasuryAmountA;
+    withheldB = withdrawnAmountB - treasuryAmountB;
+  } else if (options.treasuryAmountFlat && options.treasuryAmountA && options.treasuryAmountB) {
+    treasuryAmountFlat = options.treasuryAmountFlat;
+    treasuryAmountA = options.treasuryAmountA;
+    treasuryAmountB = options.treasuryAmountB;
+    withheldFlat = withdrawnAmountFlat - treasuryAmountFlat;
+    withheldA = withdrawnAmountA - treasuryAmountA;
+    withheldB = withdrawnAmountB - treasuryAmountB;
+  } else {
+    throw new Error("Must set 'allowance' or 'treasuryAmount' on protocol fees withdraw options");
+  }
+
+  const poolManageRedeemer = HexBlob(withEncoderHex(encodeStablePoolManageRedeemer, {
+    tag: "WithdrawFees",
+    amount: [withdrawnAmountFlat, withdrawnAmountA, withdrawnAmountB],
+    treasuryOutput: 1n,
+    poolInput: poolInputIndex,
+  }));
+
+  let poolSpendRedeemer = HexBlob(withEncoderHex(encodeStablePoolSpendRedeemer, {
+    tag: "Manage",
+  }));
+
+  let updatedPoolDatum = PlutusData.fromCbor(HexBlob(withEncoderHex(encodeStablePoolDatum, newPoolDatum)));
+
+  const poolManageAddress = new Core.Address({
+    type: Core.AddressType.RewardScript,
+    networkId: options.provider.network,
+    // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: Hash28ByteBase16(options.blueprint.poolManage.hash),
+    },
+  });
+
+  const tx = options.blaze
+    .newTransaction()
+    .addChainedInput(options.change)
+    .addInput(targetPool, PlutusData.fromCbor(poolSpendRedeemer));
+
+  for (let ref of options.references) {
+    tx.addReferenceInput(ref);
+  }
+  tx.addReferenceInput(options.settings);
+
+  for (let s of options.signers.split(",")) {
+    tx.addRequiredSigner(Core.Ed25519KeyHashHex(s));
+  }
+
+  tx.addWithdrawal(
+    poolManageAddress.toBech32() as Core.RewardAccount,
+    BigInt(0),
+    PlutusData.fromCbor(poolManageRedeemer)
+  );
+
+  let coinA = assetClassToAssetId(newPoolDatum.assetPair[0]);
+  let coinB = assetClassToAssetId(newPoolDatum.assetPair[1]);
+
+  let newPoolValue = new Core.Value(targetPool.output().amount().coin());
+  let targetPoolMa = targetPool.output().amount().multiasset();
+  let newPoolValueMa: Map<Core.AssetId, bigint> = new Map(targetPoolMa ?? new Map());
+  newPoolValue.setMultiasset(newPoolValueMa);
+
+  let poolADAReduction = withdrawnAmountFlat;
+  if (assetClassIsAda(newPoolDatum.assetPair[0])) {
+    poolADAReduction += withdrawnAmountA;
+  } else {
+    newPoolValueMa.set(coinA, (newPoolValueMa.get(coinA) ?? 0n) - withdrawnAmountA);
+  }
+  newPoolValueMa.set(coinB, (newPoolValueMa.get(coinB) ?? 0n) - withdrawnAmountB);
+  newPoolValue.setCoin(newPoolValue.coin() - poolADAReduction);
+
+  tx.lockAssets(
+    targetPool.output().address(),
+    newPoolValue,
+    updatedPoolDatum
+  );
+
+  let treasuryDatum = PlutusData.fromCbor(HexBlob("d87980"));
+  let treasuryAmount = new Core.Value(treasuryAmountFlat);
+  let treasuryAmountMa = new Map();
+  if (assetClassIsAda(newPoolDatum.assetPair[0])) {
+    treasuryAmount.setCoin(treasuryAmount.coin() + treasuryAmountA);
+  } else {
+    treasuryAmountMa.set(coinA, treasuryAmountA);
+  }
+  treasuryAmountMa.set(coinB, treasuryAmountB);
+  treasuryAmount.setMultiasset(treasuryAmountMa);
+
+  if (options.treasuryAddress.getProps().paymentPart?.type == Core.CredentialType.ScriptHash) {
+    tx.lockAssets(
+      options.treasuryAddress,
+      treasuryAmount,
+      treasuryDatum
+    );
+  } else {
+    tx.payAssets(
+      options.treasuryAddress,
+      treasuryAmount,
+      treasuryDatum
+    );
+  }
+
+  let withheldAmount = new Core.Value(withheldFlat);
+  let withheldAmountMa = new Map();
+  if (assetClassIsAda(newPoolDatum.assetPair[0])) {
+    withheldAmount.setCoin(withheldAmount.coin() + withheldA);
+  } else {
+    withheldAmountMa.set(coinA, withheldA);
+  }
+  withheldAmountMa.set(coinB, withheldB);
+  withheldAmount.setMultiasset(withheldAmountMa);
+
+  if (withheldAmount.nonzero()) {
+    tx.payAssets(
+      options.withheldAddress,
+      withheldAmount
+    );
+  }
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+
+  tx.provideCollateral([options.change]);
+
+  let poolManageScript = Script.newPlutusV2Script(
+    new PlutusV2Script(HexBlob(options.blueprint.poolManage.validator))
+  );
+  tx.provideScript(poolManageScript);
+
+  console.log(`tx (not completed): ${tx.toCbor()}`);
+  let completed = await tx.complete({ useCoinSelection: false });
+  return completed;
+}
+
+interface PoolInput {
+  utxo: TransactionUnspentOutput,
+  txHash: string,
+  protocolFees: bigint,
+  ident: string,
+}
+
 interface BuildWithdrawPoolRewards {
   blaze: Blaze<Provider, Wallet>,
   provider: Provider,
@@ -1955,6 +2252,7 @@ interface AutoWithdrawOptions {
   signers: string,
   txLogDir: string,
   todo: { pools: PoolTodo[], change: Core.TransactionUnspentOutput[] } | undefined,
+  stable: boolean | undefined,
 }
 
 function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet>, provider: Provider): AutoWithdrawOptions {
@@ -1974,6 +2272,7 @@ function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet>, prov
     signers: argv.signers,
     withheldAddress: Core.addressFromBech32(argv.withheldAddress),
     txLogDir: argv.txLogDir,
+    stable: argv.stable,
   }
 }
 
@@ -2654,28 +2953,61 @@ async function autoWithdrawRewards(options: AutoWithdrawOptions): TransactionUns
   for (let i = 0; i < todo.length; i++) {
     let thisChange = change[i];
     let targetPool = todo[i].pool.utxo;
-    let withdrawOptions: BuildWithdrawPoolRewards = {
-      blaze: options.blaze,
-      provider: options.provider,
-      settings: settings,
-      change: thisChange,
-      targetPool: todo[i].pool.ident.toString("hex"),
-      signers: options.signers,
-      withdrawnAmount: todo[i].amount,
-      remainingAmount: undefined,
-      allowance: settingsDatum.treasuryAllowance,
-      withheldAddress: options.withheldAddress,
-      references: references,
-      blueprint: options.blueprint,
-      treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(options.provider.network))),
-      poolAddress: Core.addressFromBech32(options.poolAddress),
-      treasuryAmount: undefined,
-      txLogDir: options.txLogDir,
-    };
+    let withdrawOptions: BuildWithdrawPoolRewards | BuildWithdrawStablePoolRewards | undefined = undefined;
+    if (options.stable) {
+      withdrawOptions = {
+        blaze: options.blaze,
+        provider: options.provider,
+        settings: settings,
+        change: thisChange,
+        targetPool: todo[i].pool.ident.toString("hex"),
+        signers: options.signers,
+        withdrawnAmountFlat: todo[i].amount,
+        withdrawnAmountA: todo[i].amount,
+        withdrawnAmountB: todo[i].amount,
+        remainingAmountFlat: undefined,
+        remainingAmountA: undefined,
+        remainingAmountB: undefined,
+        allowance: settingsDatum.treasuryAllowance,
+        withheldAddress: options.withheldAddress,
+        references: references,
+        blueprint: options.blueprint,
+        treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(options.provider.network))),
+        poolAddress: Core.addressFromBech32(options.poolAddress),
+        treasuryAmountFlat: undefined,
+        treasuryAmountA: undefined,
+        treasuryAmountB: undefined,
+        txLogDir: options.txLogDir,
+      };
+    } else {
+      withdrawOptions = {
+        blaze: options.blaze,
+        provider: options.provider,
+        settings: settings,
+        change: thisChange,
+        targetPool: todo[i].pool.ident.toString("hex"),
+        signers: options.signers,
+        withdrawnAmount: todo[i].amount,
+        remainingAmount: undefined,
+        allowance: settingsDatum.treasuryAllowance,
+        withheldAddress: options.withheldAddress,
+        references: references,
+        blueprint: options.blueprint,
+        treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(options.provider.network))),
+        poolAddress: Core.addressFromBech32(options.poolAddress),
+        treasuryAmount: undefined,
+        txLogDir: options.txLogDir,
+      };
+    }
 
     if (options.forceSubmit) {
       let tx = await submitAndAwaitWithRetry(options.blaze, async () => {
-        const tx = await buildWithdrawPoolRewards(withdrawOptions);
+        let tx = undefined;
+        if (options.stable) {
+          tx = await buildWithdrawStablePoolRewards(withdrawOptions);
+        } else {
+          tx = await buildWithdrawPoolRewards(withdrawOptions);
+        }
         await options.blaze.signTransaction(tx);
         console.log(`${tx.toCbor()}`);
         return tx;
@@ -2685,7 +3017,12 @@ async function autoWithdrawRewards(options: AutoWithdrawOptions): TransactionUns
     } else if (options.submit) {
       let retry = true;
       while (retry) {
-        const tx = await buildWithdrawPoolRewards(withdrawOptions);
+        let tx = undefined;
+        if (options.stable) {
+          tx = await buildWithdrawStablePoolRewards(withdrawOptions);
+        } else {
+          tx = await buildWithdrawPoolRewards(withdrawOptions);
+        }
         await options.blaze.signTransaction(tx);
         console.log(`${tx.toCbor()}`);
         const response = await prompt("Type 'submit' to submit");
@@ -2705,7 +3042,12 @@ async function autoWithdrawRewards(options: AutoWithdrawOptions): TransactionUns
       let outs = getOutputs(tx.body());
       withdrawnChange.push(outs[2], outs[3]);
     } else {
-      const tx = await buildWithdrawPoolRewards(withdrawOptions);
+      let tx = undefined;
+      if (options.stable) {
+        tx = await buildWithdrawStablePoolRewards(withdrawOptions);
+      } else {
+        tx = await buildWithdrawPoolRewards(withdrawOptions);
+      }
       let outs = getOutputs(tx.body());
       withdrawnChange.push(outs[2], outs[3]);
       console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
