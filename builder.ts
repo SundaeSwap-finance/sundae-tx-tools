@@ -894,6 +894,20 @@ function getPoolDatum(pool: Core.TransactionUnspentOutput): PoolDatum | null {
   }
 }
 
+function getStablePoolDatum(pool: Core.TransactionUnspentOutput): StablePoolDatum | null {
+  let datum = pool.output().datum();
+  if (!datum) {
+    return null;
+  }
+  let datumCbor = (datum.toCore() as any).cbor;
+  try {
+    let pd = decodeStablePoolDatum(decoder(fromHex(datumCbor)));
+    return pd;
+  } catch (e) {
+    return null;
+  }
+}
+
 // We don't really care about exotic pools with little ada because they won't contribute much to staking rewards
 function poolTVL(pool: Core.TransactionUnspentOutput): bigint {
   return pool.output().amount().coin() * 2n;
@@ -1971,6 +1985,44 @@ async function queryPools(provider: Provider, poolAddress: string, needed: bigin
   return todo;
 }
 
+async function queryStablePools(provider: Provider, poolAddress: string): Promise<PoolTodo> {
+  let poolUtxos = await provider.getUnspentOutputs(Core.addressFromBech32(poolAddress));
+  let pools = [];
+  for (let poolUtxo of poolUtxos) {
+    try {
+      let poolDatum = getStablePoolDatum(poolUtxo);
+      if (poolDatum) {
+        if (poolDatum.circulatingLp != 0n) {
+          pools.push({
+            utxo: poolUtxo,
+            txHash: poolUtxo.input().transactionId(),
+            protocolFees: poolDatum.protocolFees[0],
+            ident: poolDatum.identifier,
+          });
+        }
+      }
+    } catch (e) {
+      console.log(`queryPools: ${e}`);
+    }
+  }
+  pools.sort((poolA, poolB) => poolA.protocolFees - poolB.protocolFees > 0 ? -1 : 1);
+  let sum = 0n;
+  let count = 0;
+  let todo = [];
+  for (let pool of pools) {
+    let canWithdraw = pool.protocolFees - 3_000_000n;
+    todo.push({
+      pool: pool,
+      amount: canWithdraw,
+      partial: false,
+    });
+    sum += canWithdraw;
+    count++;
+  }
+  return todo;
+}
+
+
 // This takes a *builder* as an argument to allow automatic retrying in cases
 // where there is contention for one of the tx inputs.
 async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, buildTx: () => Promise<Transaction>): Promise<{tx: Transaction, id: string}> {
@@ -2901,7 +2953,11 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
     todo = options.todo.pools;
     change = options.todo.change;
   } else {
-    todo = await queryPools(options.provider, options.poolAddress, options.needed);
+    if (options.stable) {
+      todo = await queryStablePools(options.provider, options.poolAddress);
+    } else {
+      todo = await queryPools(options.provider, options.poolAddress, options.needed);
+    }
     change = await findChangeMany(options.provider, options.walletAddress, 10_000_000n, BigInt(todo.length));
   }
   
