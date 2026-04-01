@@ -1732,8 +1732,8 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
 
   tx.provideCollateral([options.change]);
 
-  let poolManageScript = Script.newPlutusV2Script(
-    new PlutusV2Script(HexBlob(options.blueprint.poolManage.validator))
+  let poolManageScript = Script.newPlutusV3Script(
+    new PlutusV3Script(HexBlob(options.blueprint.poolManage.validator))
   );
   tx.provideScript(poolManageScript);
 
@@ -2305,6 +2305,7 @@ interface AutoWithdrawOptions {
   needed: bigint,
   walletAddress: Address,
   blueprint: Blueprint,
+  stableBlueprint: Blueprint | undefined,
   blaze: Blaze<Provider, Wallet>,
   provider: Provider,
   references: string,
@@ -2315,10 +2316,15 @@ interface AutoWithdrawOptions {
   txLogDir: string,
   todo: { pools: PoolTodo[], change: Core.TransactionUnspentOutput[] } | undefined,
   stable: boolean | undefined,
+  stableBlueprint: Blueprint,
 }
 
 export function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet>, provider: Provider): AutoWithdrawOptions {
   let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
+  let stableBlueprint = undefined;
+  if (argv.stable) {
+    stableBlueprint = decodeBlueprint(fs.readFileSync(argv.stableBlueprint, "utf8"));
+  }
   let reportJson = fs.readFileSync(argv.reportFile, "utf8");
   let report = decodeReportFromJson(reportJson);
   return {
@@ -2326,6 +2332,7 @@ export function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet
     needed: report.payments.protocolFeesNeeded,
     walletAddress: Core.addressFromBech32(argv.walletAddress),
     blueprint: bp,
+    stableBlueprint: stableBlueprint,
     blaze: blaze,
     provider: provider,
     references: argv.references,
@@ -2972,17 +2979,19 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
     }
     change = await findChangeMany(options.provider, options.walletAddress, 10_000_000n, BigInt(todo.length));
   }
+
+  let settingsSpend = options.blueprint.settingsSpend;
   
   const settingsAddress = new Core.Address({
     type: Core.AddressType.EnterpriseScript,
     networkId: options.provider.network,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: Hash28ByteBase16(options.blueprint.settingsSpend.hash),
+      hash: Hash28ByteBase16(settingsSpend.hash),
     },
   });
 
-  const settings = await findSettings(options.provider, settingsAddress, options.blueprint.settingsSpend.hash);
+  const settings = await findSettings(options.provider, settingsAddress, settingsSpend.hash);
   let settingsDatumCbor = settings.output().datum()?.asInlineData()?.toCbor();
   if (!settingsDatumCbor) {
     throw new Error("Couldn't get settings datum");
@@ -3037,7 +3046,7 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
         allowance: settingsDatum.treasuryAllowance,
         withheldAddress: options.withheldAddress,
         references: references,
-        blueprint: options.blueprint,
+        blueprint: options.stableBlueprint,
         treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(options.provider.network))),
         poolAddress: Core.addressFromBech32(options.poolAddress),
         treasuryAmountFlat: undefined,
