@@ -1,4 +1,3 @@
-
 import * as rl from "node:readline/promises";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -34,13 +33,13 @@ import { TxBuilder } from "@blaze-cardano/tx";
 import { Emulator, EmulatorProvider } from "@blaze-cardano/emulator";
 import { Ed25519KeyHash } from "@cardano-sdk/crypto";
 import * as ed from "@noble/ed25519";
-import minimist from "minimist";
 import {
   decoder,
   decodeNewFees,
   decodeNewFeeManager,
   decodePoolDatum,
   decodeSettingsDatum,
+  decodeStablePoolDatum,
   encoder,
   withEncoder,
   withEncoderHex,
@@ -51,6 +50,11 @@ import {
   encodeNewFees,
   encodeNewFeeManager,
   encodeSettingsDatum,
+  encodeStablePoolDatum,
+  encodeStablePoolManageRedeemer,
+  encodeStablePoolSpendRedeemer,
+  assetClassIsAda,
+  assetClassToAssetId,
   newAddress,
   MultisigSignature,
   Address as CodecAddress,
@@ -59,15 +63,30 @@ import {
   ConvenienceFeeManagerRedeemerUpdateFee,
   ConvenienceFeeManagerRedeemerUpdateFeeManager,
   PoolDatum,
+  StablePoolDatum,
   SettingsDatum,
   AssetPair,
-} from "./codec.js";
+} from "./codec.ts";
 import {
   fromHex,
   stringify,
-} from "./util.js";
+} from "./util.ts";
+
+import minimist from "minimist";
 
 import { EContractVersion, QueryProviderSundaeSwap, SundaeSDK } from "@sundaeswap/core";
+
+function valueIsZero(v: Value) {
+  let coreValue = v.toCore();
+  if (coreValue.assets) {
+    for (let [assetId, amount] of coreValue.assets) {
+      if (amount != 0n) {
+        return false;
+      }
+    }
+  }
+  return coreValue.coins == 0n;
+}
 
 async function queryRewards(mainnet: boolean, stakeAddress: string): Promise<bigint | undefined> {
   const projectId = process.env["BLOCKFROST_PROJECT_ID"];
@@ -156,6 +175,36 @@ async function findPoolByIdent(provider: Provider, poolAddress: Core.Address, po
   return pool;
 }
 
+export async function findStablePoolByIdent(provider: Provider, poolAddress: Core.Address, poolIdent: string): Promise<Core.TransactionUnspentOutput> {
+  let pool = null;
+  let poolPolicy = poolAddress.getProps().paymentPart?.hash;
+  if (!poolPolicy) {
+    throw new Error("Couldn't get pool policy");
+  }
+  let poolNft = poolPolicy + "000de140" + poolIdent;
+  let poolNftAssetId = Core.AssetId(poolNft);
+  let knownPool = await provider.getUnspentOutputByNFT(poolNftAssetId);
+  if (knownPool) {
+    let datum = knownPool.output().datum();
+    if (!datum) {
+      throw new Error("invalid datum");
+    }
+    let datumInline = datum.asInlineData();
+    if (!datumInline) {
+      throw new Error("expected inline datum on stable pool");
+    }
+    let datumCbor = datumInline.toCbor();
+    let pd = decodeStablePoolDatum(decoder(fromHex(datumCbor)));
+    if (pd.identifier.toString('hex') == poolIdent) {
+      pool = knownPool;
+    }
+  }
+  if (!pool) {
+    throw new Error(`Couldn't find stable pool with ident: ${poolIdent}`);
+  }
+  return pool;
+}
+
 // Find a change utxo in the wallet having at least the given amount
 async function findChange(provider: Provider, address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput> {
   const utxos: Core.TransactionUnspentOutput[] = await provider.getUnspentOutputs(address);
@@ -212,9 +261,8 @@ async function findChangeMany(provider: Provider, address: Core.Address, amount:
 }
 
 // Collect many change utxos to meet a desired total
-async function collectChange(dryLedger: DryLedger, provider: Provider, address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput[]> {
+async function collectChange(provider: Provider, address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput[]> {
   let utxos = await provider.getUnspentOutputs(address);
-  utxos.push(...dryLedger.getUnspentTransactionOutputs());
   let change = [];
   let sum = 0n;
   utxos.sort(compareUtxo);
@@ -241,6 +289,107 @@ async function collectChange(dryLedger: DryLedger, provider: Provider, address: 
   throw new Error(`Couldn't find enough change: want ${amount} but only ${sum} is available from among ${change.length} eligible change utxos`);
 }
 
+async function fanout(blaze: Blaze<Provider, Wallet>, provider: Provider, wallet: Core.Address, changeUtxos: Core.TransactionUnspentOutput[], count: bigint, submit: boolean, forceSubmit: boolean, txLogDir: string): Core.TransactionUnspentOutput[] {
+  const tx = blaze.newTransaction();
+
+  let available = 0n;
+  for (let change of changeUtxos) {
+    tx.addInput(change);
+    available += change.output().amount().coin();
+  }
+  available -= 3_000_000n;
+
+  let dividend = available / count;
+
+  for (let i = 0n; i < count; i++) {
+    tx.payAssets(
+      wallet,
+      new Value(dividend)
+    );
+  }
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+
+  if (forceSubmit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    await blaze.submitTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    console.log("Submitted");
+    return getOutputs(completed.body());
+  } else if (submit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    const response = await prompt("Type 'submit' to submit");
+    if (response == "submit") {
+      await blaze.submitTransaction(completed);
+      console.log("Submitted");
+    }
+    return getOutputs(completed.body());
+  } else {
+    let completed = await tx.complete({ useCoinSelection: false });
+    if (txLogDir) {
+      let txid = completed.getId();
+      fs.writeFileSync(`${txLogDir}/${txid}-fanout.tx`, tx.toCbor());
+    }
+    console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
+    return getOutputs(completed.body());
+  }
+}
+
+async function paySelf(blaze: Blaze<Provider, Wallet>, provider: Provider, wallet: Core.Address, inputs: Core.TransactionUnspentOutput[], submit: boolean, forceSubmit: boolean, txLogDir: string): Core.TransactionUnspentOutput {
+  const tx = blaze.newTransaction();
+
+  for (const input of inputs) {
+    tx.addInput(input);
+  }
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+
+  if (forceSubmit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    await blaze.submitTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    console.log("Submitted");
+    return getOutputs(completed.body())[0];
+  } else if (submit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    const response = await prompt("Type 'submit' to submit");
+    if (response == "submit") {
+      await blaze.submitTransaction(completed);
+      console.log("Submitted");
+    }
+    return getOutputs(completed.body())[0];
+  } else {
+    let completed = await tx.complete({ useCoinSelection: false });
+    if (txLogDir) {
+      let txid = completed.getId();
+      fs.writeFileSync(`${txLogDir}/${txid}-pay-self.tx`, tx.toCbor());
+    }
+    console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
+    return getOutputs(completed.body())[0];
+  }
+}
+
+
 function compareUtxo(a: Core.TransactionUnspentOutput, b: Core.TransactionUnspentOutput): number {
   if (a.input().transactionId() < b.input().transactionId()) {
     return -1;
@@ -257,41 +406,41 @@ function compareUtxo(a: Core.TransactionUnspentOutput, b: Core.TransactionUnspen
   }
 }
 
-interface BlueprintScript {
+export interface BlueprintScript {
   hash: string,
   validator: string,
 }
 
-interface Blueprint {
+export interface Blueprint {
   settingsSpend: BlueprintScript,
   poolSpend: BlueprintScript,
   poolManage: BlueprintScript,
   poolStake: BlueprintScript,
 }
 
-function decodeBlueprint(blueprint: string): Blueprint {
+export function decodeBlueprint(blueprint: string): Blueprint {
   let bp: any = {};
   let o = JSON.parse(blueprint);
   for (let v of o.validators) {
-    if (v.title == "settings.spend") {
+    if (v.title.endsWith("settings.spend")) {
       bp.settingsSpend = {
         hash: v.hash,
         validator: v.compiledCode,
       };
     }
-    if (v.title == "pool.spend") {
+    if (v.title.endsWith("pool.spend")) {
       bp.poolSpend = {
         hash: v.hash,
         validator: v.compiledCode,
       };
     }
-    if (v.title == "pool.manage") {
+    if (v.title.endsWith("pool.manage") || v.title.endsWith("pool.manage.else")) {
       bp.poolManage = {
         hash: v.hash,
         validator: v.compiledCode,
       };
     }
-    if (v.title == "pool_stake.stake") {
+    if (v.title.endsWith("pool_stake.stake") || v.title.endsWith("pool_stake.else")) {
       bp.poolStake = {
         hash: v.hash,
         validator: v.compiledCode,
@@ -477,7 +626,7 @@ function parseSignatures(signatures: string): Signature[] {
   return result;
 }
 
-function prepareUpdate(argv: any) {
+export function prepareUpdate(argv: any) {
   if (argv.updateFees) {
     let updateObject: NewFees = {
       validRange: {
@@ -500,7 +649,7 @@ function prepareUpdate(argv: any) {
   }
 }
 
-async function signMessage(argv: any) {
+export async function signMessage(argv: any) {
   const skeyHex = process.env["SKEY_HEX"];
   let key = skeyHex;
   if (key == undefined) {
@@ -511,7 +660,7 @@ async function signMessage(argv: any) {
   console.log("signature: " + Buffer.from(signature).toString('hex'));
 }
 
-async function makeRedeemer(argv: any) {
+export async function makeRedeemer(argv: any) {
   if (argv.updateFees) {
     let updateObject = decodeNewFees(decoder(fromHex(argv.updateObject)));
     let signatures = parseSignatures(argv.signatures);
@@ -553,7 +702,7 @@ async function makeRedeemer(argv: any) {
   }
 }
 
-async function updateFeeManager(argv: any) {
+export async function updateFeeManager(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
   let completed = await buildUpdateFeeManager(argv);
   if (argv.submit) {
@@ -572,7 +721,7 @@ async function updateFeeManager(argv: any) {
   }
 }
 
-async function updatePoolStakeCredential(args: any, pool: Core.TransactionUnspentOutput, change: Core.TransactionUnspentOutput) {
+export async function updatePoolStakeCredential(args: any, pool: Core.TransactionUnspentOutput, change: Core.TransactionUnspentOutput) {
   let { blaze, provider } = await setupBlaze(args);
   let bp = decodeBlueprint(fs.readFileSync(args.blueprint, "utf8"));
   let poolAddress = pool.output().address();
@@ -694,7 +843,7 @@ async function updatePoolStakeCredential(args: any, pool: Core.TransactionUnspen
   return completed;
 }
 
-async function updateSinglePoolStakeCredential(argv: any) {
+export async function updateSinglePoolStakeCredential(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
   let address = Core.addressFromBech32(argv.address);
   let poolAddress = Core.addressFromBech32(argv.poolAddress);
@@ -753,6 +902,20 @@ function getPoolDatum(pool: Core.TransactionUnspentOutput): PoolDatum | null {
   let datumCbor = (datum.toCore() as any).cbor;
   try {
     let pd = decodePoolDatum(decoder(fromHex(datumCbor)));
+    return pd;
+  } catch (e) {
+    return null;
+  }
+}
+
+function getStablePoolDatum(pool: Core.TransactionUnspentOutput): StablePoolDatum | null {
+  let datum = pool.output().datum();
+  if (!datum) {
+    return null;
+  }
+  let datumCbor = (datum.toCore() as any).cbor;
+  try {
+    let pd = decodeStablePoolDatum(decoder(fromHex(datumCbor)));
     return pd;
   } catch (e) {
     return null;
@@ -988,7 +1151,7 @@ function makeScriptRef(address: Address, validator: HexBlob) {
     return ref;
 }
 
-async function testAutoWithdraw(argv: any) {
+export async function testAutoWithdraw(argv: any) {
   let testSkey = Core.Ed25519PrivateKey.fromNormalBytes(crypto.randomBytes(32));
   let testVkey = await testSkey.toPublic();
   let testPkh = await testVkey.hash();
@@ -1081,12 +1244,11 @@ async function testAutoWithdraw(argv: any) {
     console.log(utxo.toCbor());
   }
 
-  let dryLedger = new DryLedger();
-  const tx = await buildWithdrawPoolRewards(dryLedger, options);
+  const tx = await buildWithdrawPoolRewards(options);
   console.log(`Test tx: ${tx.toCbor()}`);
 }
 
-async function debugConditionedScoop(argv: any) {
+export async function debugConditionedScoop(argv: any) {
   let myAddr = Core.Address.fromBech32("addr_test1vqp4mmnx647vyutfwugav0yvxhl6pdkyg69x4xqzfl4vwwck92a9t");
   let poolAddr = Core.Address.fromBech32("addr_test1xzly6g2kvwgfhdvntwfrct0kz9erfqyntw68yt2lz54kg6kvy7vq4p2hl6wm9jdvpgn80ax3xpkm7yrgnxphtrct3klqnkjjzt");
   let scriptRefAddr = Core.Address.fromBech32("addr_test1wza7ec20249sqg87yu2aqkqp735qa02q6yd93u28gzul93gvc4wuw");
@@ -1215,7 +1377,7 @@ async function debugConditionedScoop(argv: any) {
   console.log(`emulator: submitted tx: ${txid}`);
 }
 
-async function registerStakeAddress(argv: any) {
+export async function registerStakeAddress(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
   let address = Core.addressFromBech32(argv.address);
 
@@ -1269,7 +1431,7 @@ async function registerStakeAddress(argv: any) {
   }
 }
 
-async function updateAllPoolStakeCredentials(argv: any) {
+export async function updateAllPoolStakeCredentials(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
   let address = Core.addressFromBech32(argv.address);
   let knownPools = await provider.getUnspentOutputs(Core.addressFromBech32(argv.poolAddress));
@@ -1329,6 +1491,276 @@ async function updateAllPoolStakeCredentials(argv: any) {
   }
 }
 
+interface BuildWithdrawStablePoolRewards {
+  blaze: Blaze<Provider, Wallet>,
+  provider: Provider,
+  settings: Core.TransactionUnspentOutput,
+  change: Core.TransactionUnspentOutput,
+  targetPool: string,
+  signers: string,
+  withdrawnAmountFlat: bigint,
+  withdrawnAmountA: bigint,
+  withdrawnAmountB: bigint,
+  remainingAmountFlat: bigint | undefined,
+  remainingAmountA: bigint | undefined,
+  remainingAmountB: bigint | undefined,
+  withheldAddress: Address,
+  references: Core.TransactionUnspentOutput[],
+  blueprint: Blueprint,
+  treasuryAddress: Address,
+  poolAddress: Address,
+  allowance: { numerator: bigint, denominator: bigint } | undefined,
+  treasuryAmountFlat: bigint | undefined,
+  treasuryAmountA: bigint | undefined,
+  treasuryAmountB: bigint | undefined,
+  txLogDir: string,
+}
+
+export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStablePoolRewards) {
+  let targetPool = await findStablePoolByIdent(options.provider, options.poolAddress, options.targetPool);
+  if (!targetPool) {
+    throw new Error(`Couldn't find pool utxo with target ident ${options.targetPool}`);
+  }
+  let targetPoolDatum = targetPool.output().datum();
+  if (!targetPoolDatum) {
+    throw new Error(`Missing datum on target pool`);
+  }
+  let targetPoolDatumInline = targetPoolDatum.asInlineData();
+  if (!targetPoolDatumInline) {
+    throw new Error(`Missing inline datum on target pool`);
+  }
+  let datumCbor = targetPoolDatumInline.toCbor();
+  //console.log(`pool datum: ${datumCbor}`);
+  let newPoolDatum = decodeStablePoolDatum(decoder(fromHex(datumCbor)));
+  //console.log(`decoded pool datum: ${stringify(newPoolDatum)}`);
+  let withdrawnAmountFlat;
+  if (options.withdrawnAmountFlat != undefined) {
+    withdrawnAmountFlat = BigInt(options.withdrawnAmountFlat);
+    newPoolDatum.protocolFees[0] = newPoolDatum.protocolFees[0] - withdrawnAmountFlat;
+    if (newPoolDatum.protocolFees[0] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
+  } else if (options.remainingAmountFlat != undefined) {
+    let remainingPoolFees = BigInt(options.remainingAmountFlat);
+    withdrawnAmountFlat = newPoolDatum.protocolFees[0] - remainingPoolFees;
+    newPoolDatum.protocolFees[0] = remainingPoolFees;
+    if (newPoolDatum.protocolFees[0] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
+  } else {
+    throw new Error("must pass either withdrawnAmount or remainingAmount");
+  }
+  let withdrawnAmountA;
+  if (options.withdrawnAmountA != undefined) {
+    withdrawnAmountA = BigInt(options.withdrawnAmountA);
+    newPoolDatum.protocolFees[1] = newPoolDatum.protocolFees[1] - withdrawnAmountA;
+    if (newPoolDatum.protocolFees[1] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
+  } else if (options.remainingAmountA != undefined) {
+    let remainingPoolFees = BigInt(options.remainingAmountA);
+    withdrawnAmountA = newPoolDatum.protocolFees[1] - remainingPoolFees;
+    newPoolDatum.protocolFees[1] = remainingPoolFees;
+    if (newPoolDatum.protocolFees[1] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
+  } else {
+    throw new Error("must pass either withdrawnAmount or remainingAmount");
+  }
+  let withdrawnAmountB;
+  if (options.withdrawnAmountB != undefined) {
+    withdrawnAmountB = BigInt(options.withdrawnAmountB);
+    newPoolDatum.protocolFees[2] = newPoolDatum.protocolFees[2] - withdrawnAmountB;
+    if (newPoolDatum.protocolFees[2] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
+  } else if (options.remainingAmountB != undefined) {
+    let remainingPoolFees = BigInt(options.remainingAmountB);
+    withdrawnAmountB = newPoolDatum.protocolFees[2] - remainingPoolFees;
+    newPoolDatum.protocolFees[2] = remainingPoolFees;
+    if (newPoolDatum.protocolFees[2] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
+  } else {
+    throw new Error("must pass either withdrawnAmount or remainingAmount");
+  }
+
+  let toSpend = [];
+  toSpend.push(options.change);
+  toSpend.push(targetPool);
+  toSpend.sort((a, b) => a.input().transactionId() == b.input().transactionId() ? Number(a.input().index() - b.input().index()) : (a.input().transactionId() < b.input().transactionId() ? -1 : 1));
+  let poolInputIndex = 0n;
+  for (let e of toSpend) {
+    if (e.output().address() == targetPool.output().address()) {
+      break;
+    }
+    poolInputIndex = poolInputIndex + 1n;
+  }
+
+  let treasuryAmountFlat = 0n;
+  let treasuryAmountA = 0n;
+  let treasuryAmountB = 0n;
+  let withheldFlat = 0n;
+  let withheldA = 0n;
+  let withheldB = 0n;
+
+  if (options.allowance) {
+    let n = options.allowance.denominator - options.allowance.numerator;
+    let d = options.allowance.denominator;
+    treasuryAmountFlat = n * withdrawnAmountFlat / d + 1n;
+    treasuryAmountA = n * withdrawnAmountA / d + 1n;
+    treasuryAmountB = n * withdrawnAmountB / d + 1n;
+    withheldFlat = withdrawnAmountFlat - treasuryAmountFlat;
+    withheldA = withdrawnAmountA - treasuryAmountA;
+    withheldB = withdrawnAmountB - treasuryAmountB;
+  } else if (options.treasuryAmountFlat && options.treasuryAmountA && options.treasuryAmountB) {
+    treasuryAmountFlat = options.treasuryAmountFlat;
+    treasuryAmountA = options.treasuryAmountA;
+    treasuryAmountB = options.treasuryAmountB;
+    withheldFlat = withdrawnAmountFlat - treasuryAmountFlat;
+    withheldA = withdrawnAmountA - treasuryAmountA;
+    withheldB = withdrawnAmountB - treasuryAmountB;
+  } else {
+    throw new Error("Must set 'allowance' or 'treasuryAmount' on protocol fees withdraw options");
+  }
+
+  const poolManageRedeemer = HexBlob(withEncoderHex(encodeStablePoolManageRedeemer, {
+    tag: "WithdrawFees",
+    amount: [withdrawnAmountFlat, withdrawnAmountA, withdrawnAmountB],
+    treasuryOutput: 1n,
+    poolInput: poolInputIndex,
+  }));
+
+  let poolSpendRedeemer = HexBlob(withEncoderHex(encodeStablePoolSpendRedeemer, {
+    tag: "Manage",
+  }));
+
+  let updatedPoolDatum = PlutusData.fromCbor(HexBlob(withEncoderHex(encodeStablePoolDatum, newPoolDatum)));
+
+  const poolManageAddress = new Core.Address({
+    type: Core.AddressType.RewardScript,
+    networkId: options.provider.network,
+    // See https://github.com/input-output-hk/cardano-js-sdk/blob/a1d85a290e9caed7e2c53ed46a0633e84b307458/packages/core/src/Cardano/Address/RewardAddress.ts#L117
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: Hash28ByteBase16(options.blueprint.poolManage.hash),
+    },
+  });
+
+  const tx = options.blaze
+    .newTransaction()
+    .addInput(options.change)
+    .addInput(targetPool, PlutusData.fromCbor(poolSpendRedeemer));
+
+  for (let ref of options.references) {
+    tx.addReferenceInput(ref);
+  }
+  tx.addReferenceInput(options.settings);
+
+  for (let s of options.signers.split(",")) {
+    tx.addRequiredSigner(Core.Ed25519KeyHashHex(s));
+  }
+
+  tx.addWithdrawal(
+    poolManageAddress.toBech32() as Core.RewardAccount,
+    BigInt(0),
+    PlutusData.fromCbor(poolManageRedeemer)
+  );
+
+  let coinA = assetClassToAssetId(newPoolDatum.assetPair[0]);
+  let coinB = assetClassToAssetId(newPoolDatum.assetPair[1]);
+
+  let newPoolValue = new Core.Value(targetPool.output().amount().coin());
+  let targetPoolMa = targetPool.output().amount().multiasset();
+  let newPoolValueMa: Map<Core.AssetId, bigint> = new Map(targetPoolMa ?? new Map());
+  newPoolValue.setMultiasset(newPoolValueMa);
+
+  let poolADAReduction = withdrawnAmountFlat;
+  if (assetClassIsAda(newPoolDatum.assetPair[0])) {
+    poolADAReduction += withdrawnAmountA;
+  } else {
+    newPoolValueMa.set(coinA, (newPoolValueMa.get(coinA) ?? 0n) - withdrawnAmountA);
+  }
+  newPoolValueMa.set(coinB, (newPoolValueMa.get(coinB) ?? 0n) - withdrawnAmountB);
+  newPoolValue.setCoin(newPoolValue.coin() - poolADAReduction);
+  newPoolValue.setMultiasset(newPoolValueMa);
+
+  tx.lockAssets(
+    targetPool.output().address(),
+    newPoolValue,
+    updatedPoolDatum
+  );
+
+  let treasuryDatum = PlutusData.fromCbor(HexBlob("d87980"));
+  let treasuryAmount = new Core.Value(treasuryAmountFlat);
+  let treasuryAmountMa = new Map();
+  if (assetClassIsAda(newPoolDatum.assetPair[0])) {
+    treasuryAmount.setCoin(treasuryAmount.coin() + treasuryAmountA);
+  } else {
+    treasuryAmountMa.set(coinA, treasuryAmountA);
+  }
+  treasuryAmountMa.set(coinB, treasuryAmountB);
+  treasuryAmount.setMultiasset(treasuryAmountMa);
+
+  if (options.treasuryAddress.getProps().paymentPart?.type == Core.CredentialType.ScriptHash) {
+    tx.lockAssets(
+      options.treasuryAddress,
+      treasuryAmount,
+      treasuryDatum
+    );
+  } else {
+    tx.payAssets(
+      options.treasuryAddress,
+      treasuryAmount,
+      treasuryDatum
+    );
+  }
+
+  let withheldAmount = new Core.Value(withheldFlat);
+  let withheldAmountMa = new Map();
+  if (assetClassIsAda(newPoolDatum.assetPair[0])) {
+    withheldAmount.setCoin(withheldAmount.coin() + withheldA);
+  } else {
+    withheldAmountMa.set(coinA, withheldA);
+  }
+  withheldAmountMa.set(coinB, withheldB);
+  withheldAmount.setMultiasset(withheldAmountMa);
+
+  if (!valueIsZero(withheldAmount)) {
+    tx.payAssets(
+      options.withheldAddress,
+      withheldAmount
+    );
+  }
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+
+  tx.provideCollateral([options.change]);
+
+  let poolManageScript = Script.newPlutusV3Script(
+    new PlutusV3Script(HexBlob(options.blueprint.poolManage.validator))
+  );
+  tx.provideScript(poolManageScript);
+
+  console.log(`tx (not completed): ${tx.toCbor()}`);
+  let completed = await tx.complete({ useCoinSelection: false });
+  return completed;
+}
+
+interface PoolInput {
+  utxo: TransactionUnspentOutput,
+  txHash: string,
+  protocolFees: bigint,
+  ident: string,
+}
+
 interface BuildWithdrawPoolRewards {
   blaze: Blaze<Provider, Wallet>,
   provider: Provider,
@@ -1348,7 +1780,7 @@ interface BuildWithdrawPoolRewards {
   txLogDir: string,
 }
 
-async function buildWithdrawPoolRewards(dryLedger: DryLedger, options: BuildWithdrawPoolRewards) {
+async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
   let targetPool = await findPoolByIdent(options.provider, options.poolAddress, options.targetPool);
   if (!targetPool) {
     throw new Error(`Couldn't find pool utxo with target ident ${options.targetPool}`);
@@ -1508,11 +1940,23 @@ async function buildWithdrawPoolRewards(dryLedger: DryLedger, options: BuildWith
 
   console.log(`tx (not completed): ${tx.toCbor()}`);
   let completed = await tx.complete({ useCoinSelection: false });
-  dryLedger.update(completed);
   return completed;
 }
 
-async function queryPools(provider: Provider, poolAddress: string, needed: bigint) {
+interface PoolInput {
+  utxo: TransactionUnspentOutput,
+  txHash: string,
+  protocolFees: bigint,
+  ident: string,
+}
+
+interface PoolTodo {
+  pool: PoolInput,
+  amount: bigint,
+  partial: boolean,
+}
+
+async function queryPools(provider: Provider, poolAddress: string, needed: bigint): Promise<PoolTodo> {
   let poolUtxos = await provider.getUnspentOutputs(Core.addressFromBech32(poolAddress));
   let pools = [];
   for (let poolUtxo of poolUtxos) {
@@ -1565,9 +2009,52 @@ async function queryPools(provider: Provider, poolAddress: string, needed: bigin
   return todo;
 }
 
+async function queryStablePools(provider: Provider, poolAddress: string): Promise<PoolTodo> {
+  let poolUtxos = await provider.getUnspentOutputs(Core.addressFromBech32(poolAddress));
+  let pools = [];
+  for (let poolUtxo of poolUtxos) {
+    try {
+      let poolDatum = getStablePoolDatum(poolUtxo);
+      if (poolDatum) {
+        if (poolDatum.circulatingLp != 0n) {
+          pools.push({
+            utxo: poolUtxo,
+            txHash: poolUtxo.input().transactionId(),
+            protocolFees: poolDatum.protocolFees,
+            ident: poolDatum.identifier,
+          });
+        }
+      }
+    } catch (e) {
+      console.log(`queryPools: ${e}`);
+    }
+  }
+  pools.sort((poolA, poolB) => poolA.protocolFees[0] - poolB.protocolFees[0] > 0 ? -1 : 1);
+  let sum = 0n;
+  let count = 0;
+  let todo = [];
+  for (let pool of pools) {
+    let canWithdraw = pool.protocolFees[0] - 3_000_000n;
+    if (canWithdraw <= 0n) {
+      continue;
+    }
+    todo.push({
+      pool: pool,
+      amount: canWithdraw,
+      amountA: pool.protocolFees[1],
+      amountB: pool.protocolFees[2],
+      partial: false,
+    });
+    sum += canWithdraw;
+    count++;
+  }
+  return todo;
+}
+
+
 // This takes a *builder* as an argument to allow automatic retrying in cases
 // where there is contention for one of the tx inputs.
-async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, buildTx: () => Promise<Transaction>) {
+async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, buildTx: () => Promise<Transaction>): Promise<{tx: Transaction, id: string}> {
   let confirmed = false;
   while (!confirmed) {
     let tx = await buildTx();
@@ -1576,6 +2063,7 @@ async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, buildTx: 
     confirmed = await blaze.provider.awaitTransactionConfirmation(hash, 60_000);
     if (confirmed) {
       console.log(`Confirmed ${hash}`);
+      return { tx, id: confirmed };
     } else {
       console.log(`Couldn't confirm transaction ${hash}; retrying`);
     }
@@ -1594,7 +2082,7 @@ function readSigningKeyFile(filepath: string): string {
   }
 }
 
-async function setupBlaze(args: any): Promise<{ blaze: Blaze<Provider, Wallet>, provider: Provider }> {
+export async function setupBlaze(args: any): Promise<{ blaze: Blaze<Provider, Wallet>, provider: Provider }> {
   let isMainnet = args.mainnet || false;
   let skeyFilePath = args.skeyFile;
   const projectId = process.env["BLOCKFROST_PROJECT_ID"];
@@ -1686,7 +2174,7 @@ function makePayoutOptions(argv: any, config: any, blaze: Blaze<Provider, Wallet
   };
 }
 
-async function payouts(argv: any) {
+export async function payouts(argv: any) {
   let config = JSON.parse(fs.readFileSync(argv.payoutConfig, "utf8"));
   let bp = decodeBlueprint(fs.readFileSync(config.blueprint as string, "utf8"));
   let { blaze, provider } = await setupBlaze({
@@ -1707,68 +2195,32 @@ async function doPayouts(options: PayoutOptions) {
   let report = decodeReportFromJson(reportJson);
   let payments = computePayments(report, addresses);
 
-  let dryLedger = new DryLedger();
-
-  console.log(`withdraw generic staking rewards for ${options.genericStakeAddress.toBech32()}`);
-  
-  let withdrawableGeneric = await queryRewards(
-    options.provider.network == NetworkId.Mainnet,
-    options.genericStakeAddress.toBech32(),
-  );
-  if (!withdrawableGeneric) {
-    console.log("couldn't query rewards for generic stake addr");
-    process.exit(1);
-  }
-  let withdrawGenericStakeChange = await findChange(
-    options.provider,
-    options.walletAddress,
-    1_000_000n,
-  );
-  let withdrawGenericOptions: BuildWithdrawGenericStake = {
-    blaze: options.blaze,
-    change: withdrawGenericStakeChange,
-    stakeAddress: options.genericStakeAddress,
-    withdrawnAmount: withdrawableGeneric,
-    submit: options.submit || false,
-    forceSubmit: options.forceSubmit || false,
-    stakeKeyFile: options.genericStakeKeyFile,
-    txLogDir: options.txLogDir,
-  };
-  await buildWithdrawGenericStake(dryLedger, withdrawGenericOptions);
-
-  console.log(`withdraw sundae pool staking rewards for ${options.sundaePoolStakeAddress.toBech32()}`);
-
-  let withdrawableStaking = await queryRewards(
-    options.provider.network == NetworkId.Mainnet,
-    options.sundaePoolStakeAddress.toBech32(),
-  );
-  if (!withdrawableStaking) {
-    console.log("couldn't query rewards for sundae pool stake addr");
-    process.exit(1);
-  }
-  let withdrawSundaeStakeChange = await findChange(
-    options.provider,
-    options.walletAddress,
-    1_000_000n,
-  );
-  let withdrawSundaeStakeOptions: BuildWithdrawPoolStakeRewards = {
-    blaze: options.blaze,
-    provider: options.provider,
-    change: withdrawSundaeStakeChange,
-    stakeAddress: options.sundaePoolStakeAddress,
-    withdrawnAmount: withdrawableStaking,
-    submit: options.submit || false,
-    forceSubmit: options.forceSubmit || false,
-    blueprint: options.blueprint,
-    signers: options.sundaeStakingSigner,
-    withheldAddress: options.walletAddress,
-    treasuryAddress: options.treasuryAddress, // TODO: Derive from settings datum
-    txLogDir: options.txLogDir,
-  };
-  await buildWithdrawPoolStakeRewards(dryLedger, withdrawSundaeStakeOptions);
-
   console.log("withdraw protocol fees");
-  
+
+  let stakeWithdrawalsCount = 2;
+
+  let protocolFeesTodo = await queryPools(options.provider, options.poolAddress, report.payments.protocolFeesNeeded);
+
+  let changeNeededCount = BigInt(protocolFeesTodo.length + stakeWithdrawalsCount + 1);
+  let totalChangeAmountNeeded = 10_000_000n * changeNeededCount + 3_000_000n;
+  let initialChange = await collectChange(options.provider, options.walletAddress, totalChangeAmountNeeded);
+
+  let allChange = await fanout(
+    options.blaze,
+    options.provider,
+    options.walletAddress,
+    initialChange,
+    changeNeededCount,
+    options.submit,
+    options.forceSubmit,
+    options.txLogDir,
+  );
+
+  let genericChange = allChange[0];
+  let poolStakeChange = allChange[1];
+  let extraChange = allChange[2];
+  let protocolFeesChange = allChange.slice(3);
+
   let autoWithdrawOptions: AutoWithdrawOptions = {
     poolAddress: options.poolAddress,
     needed: report.payments.protocolFeesNeeded,
@@ -1782,20 +2234,73 @@ async function doPayouts(options: PayoutOptions) {
     withheldAddress: options.withheldAddress,
     signers: options.protocolFeesSigners,
     txLogDir: options.txLogDir,
+    todo: { pools: protocolFeesTodo, change: protocolFeesChange },
   };
+
+  let protocolFeesChangeUtxos = await autoWithdrawRewards(autoWithdrawOptions);
+
+  console.log(`withdraw generic staking rewards for ${options.genericStakeAddress.toBech32()}`);
   
-  await autoWithdrawRewards(dryLedger, autoWithdrawOptions);
+  let withdrawableGeneric = await queryRewards(
+    options.provider.network == NetworkId.Mainnet,
+    options.genericStakeAddress.toBech32(),
+  );
+  if (!withdrawableGeneric) {
+    console.log("couldn't query rewards for generic stake addr");
+    process.exit(1);
+  }
+  let withdrawGenericOptions: BuildWithdrawGenericStake = {
+    blaze: options.blaze,
+    change: genericChange,
+    stakeAddress: options.genericStakeAddress,
+    withdrawnAmount: withdrawableGeneric,
+    submit: options.submit || false,
+    forceSubmit: options.forceSubmit || false,
+    stakeKeyFile: options.genericStakeKeyFile,
+    txLogDir: options.txLogDir,
+  };
+  let genericOutput = await buildWithdrawGenericStake(withdrawGenericOptions);
+
+  console.log(`withdraw sundae pool staking rewards for ${options.sundaePoolStakeAddress.toBech32()}`);
+
+  let withdrawableStaking = await queryRewards(
+    options.provider.network == NetworkId.Mainnet,
+    options.sundaePoolStakeAddress.toBech32(),
+  );
+  if (!withdrawableStaking) {
+    console.log("couldn't query rewards for sundae pool stake addr");
+    process.exit(1);
+  }
+  let withdrawSundaeStakeOptions: BuildWithdrawPoolStakeRewards = {
+    blaze: options.blaze,
+    provider: options.provider,
+    change: poolStakeChange,
+    stakeAddress: options.sundaePoolStakeAddress,
+    withdrawnAmount: withdrawableStaking,
+    submit: options.submit || false,
+    forceSubmit: options.forceSubmit || false,
+    blueprint: options.blueprint,
+    signers: options.sundaeStakingSigner,
+    withheldAddress: options.walletAddress,
+    treasuryAddress: options.treasuryAddress, // TODO: Derive from settings datum
+    txLogDir: options.txLogDir,
+  };
+  let poolStakeOutput = await buildWithdrawPoolStakeRewards(withdrawSundaeStakeOptions);
 
   console.log("collecting change for payout tx");
 
-  let change = await collectChange(
-    dryLedger,
+  let output = await paySelf(
+    options.blaze,
     options.provider,
     options.walletAddress,
-    report.payments.totalPayout + 20_000_000n,
+    [...protocolFeesChangeUtxos, genericOutput, poolStakeOutput, extraChange],
+    options.submit,
+    options.forceSubmit,
+    options.txLogDir,
   );
+
   let buildPayoutOptions: BuildPayoutOptions = {
-    changeUtxos: change,
+    changeUtxos: [output],
     blaze: options.blaze,
     report: report,
     tokenHoldersDestination: options.tokenHoldersDestination,
@@ -1809,7 +2314,7 @@ async function doPayouts(options: PayoutOptions) {
 
   console.log("building payout tx");
 
-  await payout(dryLedger, buildPayoutOptions);
+  await payout(buildPayoutOptions);
 }
 
 interface AutoWithdrawOptions {
@@ -1817,6 +2322,7 @@ interface AutoWithdrawOptions {
   needed: bigint,
   walletAddress: Address,
   blueprint: Blueprint,
+  stableBlueprint: Blueprint | undefined,
   blaze: Blaze<Provider, Wallet>,
   provider: Provider,
   references: string,
@@ -1825,17 +2331,29 @@ interface AutoWithdrawOptions {
   withheldAddress: Address,
   signers: string,
   txLogDir: string,
+  todo: { pools: PoolTodo[], change: Core.TransactionUnspentOutput[] } | undefined,
+  stable: boolean | undefined,
+  stableBlueprint: Blueprint,
 }
 
-function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet>, provider: Provider): AutoWithdrawOptions {
+export function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet>, provider: Provider): AutoWithdrawOptions {
   let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
-  let reportJson = fs.readFileSync(argv.reportFile, "utf8");
-  let report = decodeReportFromJson(reportJson);
+  let stableBlueprint = undefined;
+  if (argv.stable) {
+    stableBlueprint = decodeBlueprint(fs.readFileSync(argv.stableBlueprint, "utf8"));
+  }
+  let needed = 0n;
+  if (!argv.stable) {
+    let reportJson = fs.readFileSync(argv.reportFile, "utf8");
+    let report = decodeReportFromJson(reportJson);
+    needed = report.payments.protocolFeesNeeded;
+  }
   return {
     poolAddress: argv.poolAddress,
-    needed: report.payments.protocolFeesNeeded,
+    needed: needed,
     walletAddress: Core.addressFromBech32(argv.walletAddress),
     blueprint: bp,
+    stableBlueprint: stableBlueprint,
     blaze: blaze,
     provider: provider,
     references: argv.references,
@@ -1844,6 +2362,7 @@ function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet>, prov
     signers: argv.signers,
     withheldAddress: Core.addressFromBech32(argv.withheldAddress),
     txLogDir: argv.txLogDir,
+    stable: argv.stable,
   }
 }
 
@@ -1982,7 +2501,7 @@ interface BuildPayoutOptions {
   txLogDir: string,
 }
 
-async function doPayout(argv: any) {
+export async function doPayout(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
 
   let address = Core.addressFromBech32(argv.walletAddress);
@@ -1993,8 +2512,7 @@ async function doPayout(argv: any) {
   let report = decodeReportFromJson(reportJson);
   let payments = computePayments(report, addresses);
 
-  let dryLedger = new DryLedger();
-  let utxos = await collectChange(dryLedger, provider, address, report.payments.totalPayout + 20_000_000n);
+  let utxos = await collectChange(provider, address, report.payments.totalPayout + 20_000_000n);
 
   let options: BuildPayoutOptions = {
     blaze: blaze,
@@ -2008,7 +2526,7 @@ async function doPayout(argv: any) {
     addresses: addresses,
     txLogDir: argv.txLogDir,
   };
-  await payout(dryLedger, options);
+  await payout(options);
 }
 
 interface BuildWithdrawGenericStake {
@@ -2037,7 +2555,7 @@ interface BuildWithdrawPoolStakeRewards {
   txLogDir: string,
 }
 
-async function withdrawGenericStake(argv: any) {
+export async function withdrawGenericStake(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
   let withdrawable = null;
   if (argv.fetchRewardsAvailable) {
@@ -2058,7 +2576,7 @@ async function withdrawGenericStake(argv: any) {
   await buildWithdrawGenericStake(options);
 }
 
-async function withdrawPoolStakeRewards(argv: any) {
+export async function withdrawPoolStakeRewards(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
   let withdrawable = null;
   if (argv.fetchRewardsAvailable) {
@@ -2081,8 +2599,7 @@ async function withdrawPoolStakeRewards(argv: any) {
     treasuryAddress: Core.addressFromBech32(argv.treasuryAddress), // TODO: Derive from settings datum
     txLogDir: argv.txLogDir,
   };
-  let dryLedger = new DryLedger();
-  await buildWithdrawPoolStakeRewards(dryLedger, options);
+  await buildWithdrawPoolStakeRewards(options);
 }
 
 async function signWithStakeKey(tx: Transaction, key: Ed25519PrivateKey) {
@@ -2097,21 +2614,15 @@ async function signWithStakeKey(tx: Transaction, key: Ed25519PrivateKey) {
   tx.setWitnessSet(tws);
 }
 
-async function buildWithdrawGenericStake(dryLedger: DryLedger, options: BuildWithdrawGenericStake) {
-  console.log("buildWithdrawGenericStake 0");
+async function buildWithdrawGenericStake(options: BuildWithdrawGenericStake) {
   const tx = options.blaze.newTransaction();
 
-  console.log("buildWithdrawGenericStake 1");
   tx.addInput(options.change);
   
-  console.log("buildWithdrawGenericStake 2");
-
   tx.addWithdrawal(
     options.stakeAddress.toBech32() as Core.RewardAccount,
     options.withdrawnAmount + 1000_000_000n,
   );
-
-  console.log("buildWithdrawGenericStake 3");
 
   let stakeKeyHex = fs.readFileSync(options.stakeKeyFile, "utf8");
   const stakeKey = Core.Ed25519PrivateKey.fromNormalHex(Ed25519PrivateNormalKeyHex(stakeKeyHex));
@@ -2123,12 +2634,10 @@ async function buildWithdrawGenericStake(dryLedger: DryLedger, options: BuildWit
     await options.blaze.submitTransaction(completed);
     console.log(`${completed.toCbor()}`);
     console.log("Submitted");
+    return getOutputs(completed.body())[0];
   } else if (options.submit) {
-    console.log("buildWithdrawGenericStake 4");
     let completed = await tx.complete({ useCoinSelection: false });
-    console.log("buildWithdrawGenericStake 5");
     await signWithStakeKey(completed, stakeKey);
-    console.log("buildWithdrawGenericStake 6");
     await options.blaze.signTransaction(completed);
     console.log(`${completed.toCbor()}`);
     const response = await prompt("Type 'submit' to submit");
@@ -2136,18 +2645,19 @@ async function buildWithdrawGenericStake(dryLedger: DryLedger, options: BuildWit
       await options.blaze.submitTransaction(completed);
       console.log("Submitted");
     }
+    return getOutputs(completed.body())[0];
   } else {
     let completed = await tx.complete({ useCoinSelection: false });
-    dryLedger.update(completed);
     if (options.txLogDir) {
       let txid = completed.getId();
       fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-generic-stake.tx`, tx.toCbor());
     }
     console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
+    return getOutputs(completed.body())[0];
   }
 }
 
-async function buildWithdrawPoolStakeRewards(dryLedger: DryLedger, options: BuildWithdrawPoolStakeRewards) {
+async function buildWithdrawPoolStakeRewards(options: BuildWithdrawPoolStakeRewards) {
   const tx = options.blaze.newTransaction();
 
   tx.addInput(options.change);
@@ -2227,6 +2737,7 @@ async function buildWithdrawPoolStakeRewards(dryLedger: DryLedger, options: Buil
     await options.blaze.submitTransaction(completed);
     console.log(`${completed.toCbor()}`);
     console.log("Submitted");
+    return getOutputs(completed.body())[1];
   } else if (options.submit) {
     let completed = await tx.complete({ useCoinSelection: false });
     await options.blaze.signTransaction(completed);
@@ -2236,6 +2747,7 @@ async function buildWithdrawPoolStakeRewards(dryLedger: DryLedger, options: Buil
       await options.blaze.submitTransaction(completed);
       console.log("Submitted");
     }
+    return getOutputs(completed.body())[1];
   } else {
     let completed = await tx.complete({ useCoinSelection: false });
     if (options.txLogDir) {
@@ -2243,10 +2755,11 @@ async function buildWithdrawPoolStakeRewards(dryLedger: DryLedger, options: Buil
       fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-sundae-stake.tx`, tx.toCbor());
     }
     console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
+    return getOutputs(completed.body())[1];
   }
 }
 
-async function payout(dryLedger: DryLedger, options: BuildPayoutOptions) {
+async function payout(options: BuildPayoutOptions) {
   const tx = options.blaze.newTransaction();
 
   for (const change of options.changeUtxos) {
@@ -2401,7 +2914,25 @@ class DryLedger {
   }
 }
 
-async function makeChangeUtxos(argv: any) {
+function getOutputs(txBody: TransactionBody): Core.TransactionUnspentOutput[] {
+  let txid = txBody.hash();
+  let outs = txBody.outputs();
+
+  let ret = [];
+  let i = 0n;
+  for (let out of outs) {
+    let input = new Core.TransactionInput(txid, i);
+    let utxo = new Core.TransactionUnspentOutput(
+      input,
+      out,
+    );
+    ret.push(utxo);
+    i++;
+  }
+  return ret;
+}
+
+export async function makeChangeUtxos(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
   const tx = blaze.newTransaction();
 
@@ -2409,8 +2940,7 @@ async function makeChangeUtxos(argv: any) {
   let amount = BigInt(argv.amount);
   let address = Core.addressFromBech32(argv.address);
   
-  let dryLedger = new DryLedger();
-  let changes = await collectChange(dryLedger, provider, address, count * amount);
+  let changes = await collectChange(provider, address, count * amount);
 
   for (const change of changes) {
     tx.addInput(change);
@@ -2449,39 +2979,44 @@ async function makeChangeUtxos(argv: any) {
   }
 }
 
-async function autoWithdrawRewards(dryLedger: DryLedger, options: AutoWithdrawOptions) {
+export async function autoWithdrawRewards(options: AutoWithdrawOptions): TransactionUnspentOutput[] {
   // 1. 'queryPools': Compute optimal set of pools to withdraw from:
   //   a. Query all withdrawable pools
   //   b. Sort by amount of withdrawable funds
   //   c. Select prefix that satisfies needed amount of funds, call the length of this prefix N
   // 2. 'findChangeMany': Provision N change utxos in our wallet
   // 3. For each pool, build and submit a withdrawal TX using the `i`th change utxo (disabling automatic change selection), retrying if the submission fails due to scooper contention (usually at least one of the withdrawals needs to be retried in practice).
-  let todo = await queryPools(options.provider, options.poolAddress, options.needed);
-  //console.log(todo);
+  
+  let todo;
+  let change;
+  if (options.todo) {
+    todo = options.todo.pools;
+    change = options.todo.change;
+  } else {
+    if (options.stable) {
+      todo = await queryStablePools(options.provider, options.poolAddress);
+    } else {
+      todo = await queryPools(options.provider, options.poolAddress, options.needed);
+    }
+    change = await findChangeMany(options.provider, options.walletAddress, 10_000_000n, BigInt(todo.length));
+  }
 
-  let change = await findChangeMany(options.provider, options.walletAddress, 10_000_000n, BigInt(todo.length));
-  //for (let c of change) {
-  //  console.log({
-  //    hash: c.input().transactionId(),
-  //    index: c.input().index(),
-  //  });
-  //}
-
+  let settingsSpend = options.blueprint.settingsSpend;
+  
   const settingsAddress = new Core.Address({
     type: Core.AddressType.EnterpriseScript,
     networkId: options.provider.network,
     paymentPart: {
       type: Core.CredentialType.ScriptHash,
-      hash: Hash28ByteBase16(options.blueprint.settingsSpend.hash),
+      hash: Hash28ByteBase16(settingsSpend.hash),
     },
   });
 
-  const settings = await findSettings(options.provider, settingsAddress, options.blueprint.settingsSpend.hash);
+  const settings = await findSettings(options.provider, settingsAddress, settingsSpend.hash);
   let settingsDatumCbor = settings.output().datum()?.asInlineData()?.toCbor();
   if (!settingsDatumCbor) {
     throw new Error("Couldn't get settings datum");
   }
-  //console.log(settingsDatumCbor);
   let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
 
   let referenceData = fs.readFileSync(options.references, "utf8");
@@ -2509,39 +3044,81 @@ async function autoWithdrawRewards(dryLedger: DryLedger, options: AutoWithdrawOp
     }
   }
 
+  let withdrawnChange = [];
+
   for (let i = 0; i < todo.length; i++) {
     let thisChange = change[i];
     let targetPool = todo[i].pool.utxo;
-    let withdrawOptions: BuildWithdrawPoolRewards = {
-      blaze: options.blaze,
-      provider: options.provider,
-      settings: settings,
-      change: thisChange,
-      targetPool: todo[i].pool.ident.toString("hex"),
-      signers: options.signers,
-      withdrawnAmount: todo[i].amount,
-      remainingAmount: undefined,
-      allowance: settingsDatum.treasuryAllowance,
-      withheldAddress: options.withheldAddress,
-      references: references,
-      blueprint: options.blueprint,
-      treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(options.provider.network))),
-      poolAddress: Core.addressFromBech32(options.poolAddress),
-      treasuryAmount: undefined,
-      txLogDir: options.txLogDir,
-    };
+    let withdrawOptions: BuildWithdrawPoolRewards | BuildWithdrawStablePoolRewards | undefined = undefined;
+    if (options.stable) {
+      withdrawOptions = {
+        blaze: options.blaze,
+        provider: options.provider,
+        settings: settings,
+        change: thisChange,
+        targetPool: todo[i].pool.ident.toString("hex"),
+        signers: options.signers,
+        withdrawnAmountFlat: todo[i].amount,
+        withdrawnAmountA: todo[i].amountA,
+        withdrawnAmountB: todo[i].amountB,
+        remainingAmountFlat: undefined,
+        remainingAmountA: undefined,
+        remainingAmountB: undefined,
+        allowance: settingsDatum.treasuryAllowance,
+        withheldAddress: options.withheldAddress,
+        references: references,
+        blueprint: options.stableBlueprint,
+        treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(options.provider.network))),
+        poolAddress: Core.addressFromBech32(options.poolAddress),
+        treasuryAmountFlat: undefined,
+        treasuryAmountA: undefined,
+        treasuryAmountB: undefined,
+        txLogDir: options.txLogDir,
+      };
+    } else {
+      withdrawOptions = {
+        blaze: options.blaze,
+        provider: options.provider,
+        settings: settings,
+        change: thisChange,
+        targetPool: todo[i].pool.ident.toString("hex"),
+        signers: options.signers,
+        withdrawnAmount: todo[i].amount,
+        remainingAmount: undefined,
+        allowance: settingsDatum.treasuryAllowance,
+        withheldAddress: options.withheldAddress,
+        references: references,
+        blueprint: options.blueprint,
+        treasuryAddress: Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(options.provider.network))),
+        poolAddress: Core.addressFromBech32(options.poolAddress),
+        treasuryAmount: undefined,
+        txLogDir: options.txLogDir,
+      };
+    }
 
     if (options.forceSubmit) {
-      await submitAndAwaitWithRetry(options.blaze, async () => {
-        const tx = await buildWithdrawPoolRewards(dryLedger, withdrawOptions);
+      let tx = await submitAndAwaitWithRetry(options.blaze, async () => {
+        let tx = undefined;
+        if (options.stable) {
+          tx = await buildWithdrawStablePoolRewards(withdrawOptions);
+        } else {
+          tx = await buildWithdrawPoolRewards(withdrawOptions);
+        }
         await options.blaze.signTransaction(tx);
         console.log(`${tx.toCbor()}`);
         return tx;
       });
+      let outs = getOutputs(tx.body());
+      withdrawnChange.push(outs[2], outs[3]);
     } else if (options.submit) {
       let retry = true;
       while (retry) {
-        const tx = await buildWithdrawPoolRewards(dryLedger, withdrawOptions);
+        let tx = undefined;
+        if (options.stable) {
+          tx = await buildWithdrawStablePoolRewards(withdrawOptions);
+        } else {
+          tx = await buildWithdrawPoolRewards(withdrawOptions);
+        }
         await options.blaze.signTransaction(tx);
         console.log(`${tx.toCbor()}`);
         const response = await prompt("Type 'submit' to submit");
@@ -2558,8 +3135,17 @@ async function autoWithdrawRewards(dryLedger: DryLedger, options: AutoWithdrawOp
           process.exit(0);
         }
       }
+      let outs = getOutputs(tx.body());
+      withdrawnChange.push(outs[2], outs[3]);
     } else {
-      const tx = await buildWithdrawPoolRewards(dryLedger, withdrawOptions);
+      let tx = undefined;
+      if (options.stable) {
+        tx = await buildWithdrawStablePoolRewards(withdrawOptions);
+      } else {
+        tx = await buildWithdrawPoolRewards(withdrawOptions);
+      }
+      let outs = getOutputs(tx.body());
+      withdrawnChange.push(outs[2], outs[3]);
       console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
       if (options.txLogDir) {
         let txid = tx.getId();
@@ -2569,6 +3155,7 @@ async function autoWithdrawRewards(dryLedger: DryLedger, options: AutoWithdrawOp
     totalWithdrawn += todo[i].amount;
     console.log(`Total withdrawn so far: ${totalWithdrawn}`);
   }
+  return withdrawnChange;
 }
 
 let argv = minimist(process.argv.slice(2));
@@ -2591,8 +3178,7 @@ if (argv.buildUpdateFeeManager) {
 } else if (argv.autoWithdrawRewards) {
   let { blaze, provider } = await setupBlaze(argv);
   let opts = makeAutoWithdrawOptions(argv, blaze, provider);
-  let dryLedger = new DryLedger();
-  await autoWithdrawRewards(dryLedger, opts);
+  await autoWithdrawRewards(opts);
 } else if (argv.testAutoWithdraw) {
   await testAutoWithdraw(argv);
 } else if (argv.doPayouts) {
