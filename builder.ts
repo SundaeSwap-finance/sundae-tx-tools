@@ -1535,10 +1535,16 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   if (options.withdrawnAmountFlat != undefined) {
     withdrawnAmountFlat = BigInt(options.withdrawnAmountFlat);
     newPoolDatum.protocolFees[0] = newPoolDatum.protocolFees[0] - withdrawnAmountFlat;
+    if (newPoolDatum.protocolFees[0] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
   } else if (options.remainingAmountFlat != undefined) {
     let remainingPoolFees = BigInt(options.remainingAmountFlat);
     withdrawnAmountFlat = newPoolDatum.protocolFees[0] - remainingPoolFees;
     newPoolDatum.protocolFees[0] = remainingPoolFees;
+    if (newPoolDatum.protocolFees[0] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
   } else {
     throw new Error("must pass either withdrawnAmount or remainingAmount");
   }
@@ -1546,10 +1552,16 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   if (options.withdrawnAmountA != undefined) {
     withdrawnAmountA = BigInt(options.withdrawnAmountA);
     newPoolDatum.protocolFees[1] = newPoolDatum.protocolFees[1] - withdrawnAmountA;
+    if (newPoolDatum.protocolFees[1] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
   } else if (options.remainingAmountA != undefined) {
     let remainingPoolFees = BigInt(options.remainingAmountA);
     withdrawnAmountA = newPoolDatum.protocolFees[1] - remainingPoolFees;
     newPoolDatum.protocolFees[1] = remainingPoolFees;
+    if (newPoolDatum.protocolFees[1] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
   } else {
     throw new Error("must pass either withdrawnAmount or remainingAmount");
   }
@@ -1557,10 +1569,16 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   if (options.withdrawnAmountB != undefined) {
     withdrawnAmountB = BigInt(options.withdrawnAmountB);
     newPoolDatum.protocolFees[2] = newPoolDatum.protocolFees[2] - withdrawnAmountB;
+    if (newPoolDatum.protocolFees[2] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
   } else if (options.remainingAmountB != undefined) {
     let remainingPoolFees = BigInt(options.remainingAmountB);
     withdrawnAmountB = newPoolDatum.protocolFees[2] - remainingPoolFees;
     newPoolDatum.protocolFees[2] = remainingPoolFees;
+    if (newPoolDatum.protocolFees[2] < 0n) {
+      throw new Error("withdrawal would leave negative protocol fees");
+    }
   } else {
     throw new Error("must pass either withdrawnAmount or remainingAmount");
   }
@@ -1590,15 +1608,6 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
     treasuryAmountFlat = n * withdrawnAmountFlat / d + 1n;
     treasuryAmountA = n * withdrawnAmountA / d + 1n;
     treasuryAmountB = n * withdrawnAmountB / d + 1n;
-    if (treasuryAmountFlat < 1000000n) {
-      treasuryAmountFlat = 1000000n;
-    }
-    if (treasuryAmountA < 1000000n) {
-      treasuryAmountA = 1000000n;
-    }
-    if (treasuryAmountB < 1000000n) {
-      treasuryAmountB = 1000000n;
-    }
     withheldFlat = withdrawnAmountFlat - treasuryAmountFlat;
     withheldA = withdrawnAmountA - treasuryAmountA;
     withheldB = withdrawnAmountB - treasuryAmountB;
@@ -1672,6 +1681,7 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   }
   newPoolValueMa.set(coinB, (newPoolValueMa.get(coinB) ?? 0n) - withdrawnAmountB);
   newPoolValue.setCoin(newPoolValue.coin() - poolADAReduction);
+  newPoolValue.setMultiasset(newPoolValueMa);
 
   tx.lockAssets(
     targetPool.output().address(),
@@ -2008,7 +2018,7 @@ async function queryStablePools(provider: Provider, poolAddress: string): Promis
           pools.push({
             utxo: poolUtxo,
             txHash: poolUtxo.input().transactionId(),
-            protocolFees: poolDatum.protocolFees[0],
+            protocolFees: poolDatum.protocolFees,
             ident: poolDatum.identifier,
           });
         }
@@ -2017,15 +2027,20 @@ async function queryStablePools(provider: Provider, poolAddress: string): Promis
       console.log(`queryPools: ${e}`);
     }
   }
-  pools.sort((poolA, poolB) => poolA.protocolFees - poolB.protocolFees > 0 ? -1 : 1);
+  pools.sort((poolA, poolB) => poolA.protocolFees[0] - poolB.protocolFees[0] > 0 ? -1 : 1);
   let sum = 0n;
   let count = 0;
   let todo = [];
   for (let pool of pools) {
-    let canWithdraw = pool.protocolFees - 3_000_000n;
+    let canWithdraw = pool.protocolFees[0] - 3_000_000n;
+    if (canWithdraw <= 0n) {
+      continue;
+    }
     todo.push({
       pool: pool,
       amount: canWithdraw,
+      amountA: pool.protocolFees[1],
+      amountB: pool.protocolFees[2],
       partial: false,
     });
     sum += canWithdraw;
@@ -3038,8 +3053,8 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
         targetPool: todo[i].pool.ident.toString("hex"),
         signers: options.signers,
         withdrawnAmountFlat: todo[i].amount,
-        withdrawnAmountA: todo[i].amount,
-        withdrawnAmountB: todo[i].amount,
+        withdrawnAmountA: todo[i].amountA,
+        withdrawnAmountB: todo[i].amountB,
         remainingAmountFlat: undefined,
         remainingAmountA: undefined,
         remainingAmountB: undefined,

@@ -1236,13 +1236,10 @@ export function encodeStablePoolManageRedeemer(e: Encoder, redeemer: any) {
 }
 
 export function encodeStablePoolSpendRedeemer(e: Encoder, redeemer: any) {
-  encodeTag8(e, 122n);
-  encodeBeginArrayIndefinite(e);
   if (redeemer.tag == "Manage") {
     encodeTag8(e, 122n);
     encodeEmptyArray(e);
   } else {
     throw new Error("Invalid stable pool spend redeemer: " + JSON.stringify(redeemer));
   }
-  encodeBreak(e);
 }
