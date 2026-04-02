@@ -2340,11 +2340,15 @@ export function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet
   if (argv.stable) {
     stableBlueprint = decodeBlueprint(fs.readFileSync(argv.stableBlueprint, "utf8"));
   }
-  let reportJson = fs.readFileSync(argv.reportFile, "utf8");
-  let report = decodeReportFromJson(reportJson);
+  let needed = 0n;
+  if (!argv.stable) {
+    let reportJson = fs.readFileSync(argv.reportFile, "utf8");
+    let report = decodeReportFromJson(reportJson);
+    needed = report.payments.protocolFeesNeeded;
+  }
   return {
     poolAddress: argv.poolAddress,
-    needed: report.payments.protocolFeesNeeded,
+    needed: needed,
     walletAddress: Core.addressFromBech32(argv.walletAddress),
     blueprint: bp,
     stableBlueprint: stableBlueprint,
