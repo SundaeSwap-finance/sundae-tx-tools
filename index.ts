@@ -260,6 +260,185 @@ async function findChangeMany(provider: Provider, address: Core.Address, amount:
   return change;
 }
 
+class Multiasset {
+  ma: Map<string, bigint>;
+  
+  public constructor() {
+    this.ma = new Map();
+  }
+  
+  public get(a: string) {
+    let q = this.ma.get(a);
+    if (q) {
+      return q;
+    } else {
+      return 0n;
+    }
+  }
+
+  public addAsset(a: string, amount: bigint) {
+    let q = this.ma.get(a);
+    if (q) {
+      this.ma.set(a, q + amount);
+    } else {
+      this.ma.set(a, amount);
+    }
+  }
+
+  public contains(ma: Multiasset) {
+    for (const [otherAsset, otherQuantity] of ma) {
+      if (this.get(otherAsset) < otherQuantity) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  public addMultiasset(ma: Multiasset) {
+    for (const [otherAsset, otherQuantity] of ma) {
+      this.addAsset(otherAsset, otherQuantity);
+    }
+  }
+
+  public unwrap(): [bigint, Map<AssetId, bigint>] {
+    let coin = 0n;
+    let result = new Map();
+    for (const [k, v] of this.ma) {
+      if (k == "") {
+        coin = v;
+      } else {
+        let assetId = Core.AssetId(k);
+        result.set(assetId, v);
+      }
+    }
+    return [coin, result];
+  }
+
+  public toCoreValue(): Core.Value {
+    let [coin, ma] = this.unwrap();
+    let output = new Core.Value(coin);
+    output.setMultiasset(ma);
+    return output;
+  }
+
+  *[Symbol.iterator]() {
+    for (const [k,v] of this.ma) {
+      yield [k, v];
+    }
+  }
+}
+ 
+async function collectChangeMa(provider: Provider, address: Core.Address, multiasset: Multiasset): Promise<Core.TransactionUnspentOutput[]> {
+  let utxos = await provider.getUnspentOutputs(address);
+  for (let utxo of utxos) {
+    console.log(`${utxo.input().transactionId()}`);
+  }
+  let change = new Set();
+  let sum = 0n;
+  let utxosByAsset: Map<string, Core.TransactionUnspentOutput[]> = new Map();
+  // For each asset that we want, make a copy of our utxo list in descending order of quantity of that asset
+  for (const [asset, quantity] of multiasset) {
+    if (asset == "") {
+      let utxosCopy = [...utxos];
+      utxosCopy.sort(compareUtxoByAsset(null));
+      utxosByAsset.set(asset, utxosCopy);
+    } else {
+      let utxosCopy = [...utxos];
+      utxosCopy.sort(compareUtxoByAsset(Core.AssetId(asset)));
+      utxosByAsset.set(asset, utxosCopy);
+    }
+  }
+  // For each asset that we want, add utxos in order from most to least until
+  // we have enough of that asset
+  let have: Multiasset = new Multiasset();
+  for (const [asset, need] of multiasset) {
+    console.log(`Asset is '${asset}'`);
+    if (need == 0n) {
+      continue;
+    }
+    for (const utxo of utxosByAsset.get(asset)) {
+      let txid = utxo.input().transactionId();
+      let txix = utxo.input().index();
+      console.log(`  Considering utxo ${txid}#${txix}`);
+      // Skip utxos with scripts
+      if (utxo.output().scriptRef()) {
+        continue;
+      }
+      // Skip utxos with datums
+      if (utxo.output().datum()) {
+        continue;
+      }
+
+      if (change.has(utxo)) {
+        console.log(`  Ignoring, because we have already added this to change`);
+        continue;
+      }
+      
+      if (asset == "") {
+        console.log(`  Adding this utxo`);
+        let quantity = utxo.output().amount().coin();
+        console.log(`    have += '${asset}': ${quantity}`);
+        have.addAsset(asset, quantity);
+        for (const [asset, quantity] of utxo.output().amount().multiasset()) {
+          console.log(`    have += '${asset}': ${quantity}`);
+          have.addAsset(asset, quantity);
+        }
+        change.add(utxo);
+      } else {
+        console.log(`  Adding this utxo`);
+        for (const [k, v] of utxo.output().amount().multiasset()) {
+          console.log(`  Ma ${k} ${v}`);
+        }
+        let quantity = utxo.output().amount().multiasset().get(Core.AssetId(asset));
+        if (quantity) {
+          for (const [asset, quantity] of utxo.output().amount().multiasset()) {
+            console.log(`    have += '${asset}': ${quantity}`);
+            have.addAsset(asset, quantity);
+          }
+          change.add(utxo);
+        } else {
+          console.log(`    the utxo has none of '${asset}'`);
+        }
+      }
+
+      if (have.get(asset) >= need) {
+        console.log(`  We have enough of '${asset}'`);
+        break;
+      }
+    }
+    if (have.get(asset) < need) {
+      for (let [k, v] of have) {
+        console.log(`We have ${v} of ${k} (${have.get(k)})`);
+      }
+      throw new Error(`Couldn't find enough change: want ${need} of asset '${asset}' but only ${have.get(asset)} is available from among ${change.size} eligible change utxos`);      
+    }
+  }
+  return change;
+}
+
+async function collectChangeAllowingAssets(provider: Provider, address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput[]> {
+  let utxos = await provider.getUnspentOutputs(address);
+  let change = [];
+  let sum = 0n;
+  utxos.sort(compareUtxo);
+  for (const utxo of utxos) {
+    // Skip utxos with scripts
+    if (utxo.output().scriptRef()) {
+      continue;
+    }
+    // Skip utxos with datums
+    if (utxo.output().datum()) {
+      continue;
+    }
+    change.push(utxo);
+    sum += utxo.output().amount().coin();
+    if (sum >= amount) {
+      return change;
+    }
+  }
+  throw new Error(`Couldn't find enough change: want ${amount} but only ${sum} is available from among ${change.length} eligible change utxos`);
+}
+
 // Collect many change utxos to meet a desired total
 async function collectChange(provider: Provider, address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput[]> {
   let utxos = await provider.getUnspentOutputs(address);
@@ -389,6 +568,19 @@ async function paySelf(blaze: Blaze<Provider, Wallet>, provider: Provider, walle
   }
 }
 
+function compareUtxoByAsset(asset: AssetId | null) {
+  return function(a: Core.TransactionUnspentOutput, b: Core.TransactionUnspentOutput): number {
+    let amountA = asset ? a.output().amount().multiasset().get(asset) : a.output().amount().coin();
+    let amountB = asset ? b.output().amount().multiasset().get(asset) : b.output().amount().coin();
+    if (amountA > amountB) {
+      return -1;
+    } else if (amountA < amountB ){
+      return 1;
+    } else {
+      return 0;
+    }
+  };
+}
 
 function compareUtxo(a: Core.TransactionUnspentOutput, b: Core.TransactionUnspentOutput): number {
   if (a.input().transactionId() < b.input().transactionId()) {
@@ -1607,9 +1799,9 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   if (options.allowance) {
     let n = options.allowance.denominator - options.allowance.numerator;
     let d = options.allowance.denominator;
-    treasuryAmountFlat = n * withdrawnAmountFlat / d + 1n;
-    treasuryAmountA = n * withdrawnAmountA / d + 1n;
-    treasuryAmountB = n * withdrawnAmountB / d + 1n;
+    treasuryAmountFlat = n * withdrawnAmountFlat / d;
+    treasuryAmountA = n * withdrawnAmountA / d;
+    treasuryAmountB = n * withdrawnAmountB / d;
     withheldFlat = withdrawnAmountFlat - treasuryAmountFlat;
     withheldA = withdrawnAmountA - treasuryAmountA;
     withheldB = withdrawnAmountB - treasuryAmountB;
@@ -1697,9 +1889,13 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   if (assetClassIsAda(newPoolDatum.assetPair[0])) {
     treasuryAmount.setCoin(treasuryAmount.coin() + treasuryAmountA);
   } else {
-    treasuryAmountMa.set(coinA, treasuryAmountA);
+    if (treasuryAmountA > 0n) {
+      treasuryAmountMa.set(coinA, treasuryAmountA);
+    }
   }
-  treasuryAmountMa.set(coinB, treasuryAmountB);
+  if (treasuryAmountB > 0n) {
+    treasuryAmountMa.set(coinB, treasuryAmountB);
+  }
   treasuryAmount.setMultiasset(treasuryAmountMa);
 
   if (options.treasuryAddress.getProps().paymentPart?.type == Core.CredentialType.ScriptHash) {
@@ -1721,9 +1917,13 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   if (assetClassIsAda(newPoolDatum.assetPair[0])) {
     withheldAmount.setCoin(withheldAmount.coin() + withheldA);
   } else {
-    withheldAmountMa.set(coinA, withheldA);
+    if (withheldA > 0n) {
+      withheldAmountMa.set(coinA, withheldA);
+    }
   }
-  withheldAmountMa.set(coinB, withheldB);
+  if (withheldB > 0n) {
+    withheldAmountMa.set(coinB, withheldB);
+  }
   withheldAmount.setMultiasset(withheldAmountMa);
 
   if (!valueIsZero(withheldAmount)) {
@@ -2370,15 +2570,14 @@ interface Report {
   feesPaid: FeesPaid,
   totalScoopers: bigint,
   payments: ExtraPayments,
+  delegatedScoopers: string[],
 }
 
 type FeesPaid = Map<string, bigint>;
 
 interface ExtraPayments {
-  sundaeAWSFee: bigint,
-  sundaeMiscFee: bigint,
   tokenHoldersFee: bigint,
-  usdmFundFee: bigint,
+  yieldFarming: bigint,
   flat: bigint,
   totalPayout: bigint,
   protocolFeesNeeded: bigint,
@@ -2402,15 +2601,16 @@ function decodeReportFromJson(json: string): Report {
     feesPaid: new Map(),
     totalScoopers: 0n,
     payments: {
-      sundaeAWSFee: 0n,
-      sundaeMiscFee: 0n,
       tokenHoldersFee: 0n,
-      usdmFundFee: 0n,
+      yieldFarming: 0n,
       flat: 0n,
       totalPayout: 0n,
       protocolFeesNeeded: 0n,
     },
+    delegatedScoopers: [],
   };
+
+  report.delegatedScoopers = obj.delegatedScoopers;
 
   for (const [scooperName, feesPaid] of Object.entries(obj.feesPaid)) {
     report.feesPaid.set(scooperName, BigInt(feesPaid as number));
@@ -2423,34 +2623,26 @@ function decodeReportFromJson(json: string): Report {
   if (!obj.payments) {
     throw new Error("Missing 'payments'");
   }
-  if (!obj.payments.sundaeAWSFee) {
-    throw new Error("Missing 'payments.sundaeAWSFee'");
+  if (typeof obj.payments.yieldFarming== undefined) {
+    throw new Error("Missing 'payments.yieldFarming'");
   }
-  report.payments.sundaeAWSFee = BigInt(obj.payments.sundaeAWSFee);
-  if (!obj.payments.sundaeMiscFee) {
-    throw new Error("Missing 'payments.sundaeMiscFee'");
-  }
-  report.payments.sundaeMiscFee = BigInt(obj.payments.sundaeMiscFee);
-  if (!obj.payments.tokenHoldersFee) {
+  report.payments.yieldFarming = BigInt(obj.payments.yieldFarming);
+  if (typeof obj.payments.tokenHoldersFee == undefined) {
     throw new Error("Missing 'payments.tokenHoldersFee'");
   }
   report.payments.tokenHoldersFee = BigInt(obj.payments.tokenHoldersFee);
-  if (!obj.payments.usdmFundFee) {
-    throw new Error("Missing 'payments.usdmFundFee'");
-  }
-  report.payments.usdmFundFee = BigInt(obj.payments.usdmFundFee);
 
-  if (!obj.payments.flat) {
+  if (typeof obj.payments.flat == undefined) {
     throw new Error("Missing 'payments.flat'");
   }
   report.payments.flat = BigInt(obj.payments.flat);
 
-  if (!obj.payments.totalPayout) {
+  if (typeof obj.payments.totalPayout == undefined) {
     throw new Error("Missing 'payments.totalPayout'");
   }
   report.payments.totalPayout = BigInt(obj.payments.totalPayout);
 
-  if (!obj.payments.protocolFeesNeeded) {
+  if (typeof obj.payments.protocolFeesNeeded == undefined) {
     throw new Error("Missing 'payments.protocolFeesNeeded'");
   }
   report.payments.protocolFeesNeeded = BigInt(obj.payments.protocolFeesNeeded);
@@ -2472,7 +2664,12 @@ function computePayments(report: Report, addresses: Addresses): Payment[] {
     if (!resolvedAddress) {
       throw new Error(`Couldn't resolve an address for scooper ${scooperName}`);
     }
-    let totalPayment = feesPaid + report.payments.flat;
+    let flat = report.payments.flat;
+    if (report.delegatedScoopers.includes(scooperName)) {
+      // Skip rewards to delegated scoopers 
+      flat = 0n;
+    }
+    let totalPayment = feesPaid + flat;
     payments.push({ address: resolvedAddress, lovelace: totalPayment });
   }
   return payments;
@@ -2512,14 +2709,20 @@ export async function doPayout(argv: any) {
   let report = decodeReportFromJson(reportJson);
   let payments = computePayments(report, addresses);
 
-  let utxos = await collectChange(provider, address, report.payments.totalPayout + 20_000_000n);
+  let need = new Multiasset();
+  need.addAsset("", report.payments.totalPayout + 20_000_000n);
+  need.addAsset(
+    "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d7753554e444145",
+    report.payments.yieldFarming
+  );
+  let utxos = await collectChangeMa(provider, address, need);
 
   let options: BuildPayoutOptions = {
     blaze: blaze,
     changeUtxos: utxos,
     report: report,
+    yieldFarmingDestination: Core.addressFromBech32(argv.yieldFarmingDestination),
     tokenHoldersDestination: Core.addressFromBech32(argv.tokenHoldersDestination),
-    otherPaymentsDestination: Core.addressFromBech32(argv.otherPaymentsDestination),
     submit: argv.submit,
     forceSubmit: argv.forceSubmit,
     scooperPayments: payments,
@@ -2584,7 +2787,7 @@ export async function withdrawPoolStakeRewards(argv: any) {
   }
   let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
   let address = Core.addressFromBech32(argv.walletAddress);
-  let change = await findChange(provider, address, 1000000n);
+  let change = await findChange(provider, address, 2000000n);
   let options: BuildWithdrawPoolStakeRewards = {
     blaze: blaze,
     provider: provider,
@@ -2621,11 +2824,17 @@ async function buildWithdrawGenericStake(options: BuildWithdrawGenericStake) {
   
   tx.addWithdrawal(
     options.stakeAddress.toBech32() as Core.RewardAccount,
-    options.withdrawnAmount + 1000_000_000n,
+    options.withdrawnAmount,
   );
 
-  let stakeKeyHex = fs.readFileSync(options.stakeKeyFile, "utf8");
-  const stakeKey = Core.Ed25519PrivateKey.fromNormalHex(Ed25519PrivateNormalKeyHex(stakeKeyHex));
+  let stakeKey;
+  if (options.stakeKeyFile) {
+    if (!options.submit && !options.forceSubmit) {
+      throw new Error("Must supply a stake key if submit or forceSubmit is passed");
+    }
+    let stakeKeyHex = fs.readFileSync(options.stakeKeyFile, "utf8");
+    stakeKey = Core.Ed25519PrivateKey.fromNormalHex(Ed25519PrivateNormalKeyHex(stakeKeyHex));
+  }
 
   if (options.forceSubmit) {
     let completed = await tx.complete({ useCoinSelection: false });
@@ -2773,17 +2982,15 @@ async function payout(options: BuildPayoutOptions) {
     options.tokenHoldersDestination,
     new Core.Value(options.report.payments.tokenHoldersFee),
   );
-  tx.payAssets(
-    options.otherPaymentsDestination,
-    new Core.Value(options.report.payments.sundaeMiscFee),
+  let yieldFarmingSundaeValue = new Multiasset();
+  yieldFarmingSundaeValue.addAsset("", 2_000_000);
+  yieldFarmingSundaeValue.addAsset(
+    "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d77.53554e444145",
+    options.report.payments.yieldFarming
   );
   tx.payAssets(
-    options.otherPaymentsDestination,
-    new Core.Value(options.report.payments.sundaeAWSFee),
-  );
-  tx.payAssets(
-    options.otherPaymentsDestination,
-    new Core.Value(options.report.payments.usdmFundFee),
+    options.yieldFarmingDestination,
+    yieldFarmingSundaeValue.toCoreValue(),
   );
 
   let timestamp = displayPreviousMonth(new Date());
@@ -2809,11 +3016,16 @@ async function payout(options: BuildPayoutOptions) {
       throw new Error(`No known address for ${name}`);
     }
     let paymentCredHash = address.getProps().paymentPart!.hash;
+    let flat = options.report.payments.flat;
+    // Skip rewards to delegated scoopers
+    if (options.report.delegatedScoopers.includes(name)) {
+      flat = 0n;
+    }
     breakdownMeta.set(
       fromHex(paymentCredHash),
       new Map([
         ["fees", fees],
-        ["rewards", options.report.payments.flat]
+        ["rewards", flat]
       ]),
     );
   }
@@ -2940,7 +3152,7 @@ export async function makeChangeUtxos(argv: any) {
   let amount = BigInt(argv.amount);
   let address = Core.addressFromBech32(argv.address);
   
-  let changes = await collectChange(provider, address, count * amount);
+  let changes = await collectChangeAllowingAssets(provider, address, count * amount);
 
   for (const change of changes) {
     tx.addInput(change);
@@ -2998,7 +3210,7 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
     } else {
       todo = await queryPools(options.provider, options.poolAddress, options.needed);
     }
-    change = await findChangeMany(options.provider, options.walletAddress, 10_000_000n, BigInt(todo.length));
+    change = await findChangeMany(options.provider, options.walletAddress, 7_000_000n, BigInt(todo.length));
   }
 
   let settingsSpend = options.blueprint.settingsSpend;
@@ -3112,8 +3324,8 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
       withdrawnChange.push(outs[2], outs[3]);
     } else if (options.submit) {
       let retry = true;
+      let tx = undefined;
       while (retry) {
-        let tx = undefined;
         if (options.stable) {
           tx = await buildWithdrawStablePoolRewards(withdrawOptions);
         } else {
@@ -3158,6 +3370,67 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
   return withdrawnChange;
 }
 
+async function makePayment(argv: any) {
+  let { blaze, provider } = await setupBlaze(argv);
+  const tx = blaze.newTransaction();
+
+  let amount = BigInt(argv.amount);
+  let wallet = Core.addressFromBech32(argv.walletAddress);
+  let destination = Core.addressFromBech32(argv.destination);
+
+  if (argv.coins) {
+    let need = new Multiasset(); 
+    need.addAsset("", amount);
+    for (let coinExpr of argv.coins.split(",")) {
+      let [coin, quantity] = coinExpr.split(":");
+      let assetId = Core.AssetId(coin);
+      need.addAsset(coin, BigInt(quantity));
+    }
+    let changes = await collectChangeMa(provider, wallet, need);
+    for (const change of changes) {
+      tx.addInput(change);
+    }
+    let paymentAmount = need.toCoreValue();
+    tx.payAssets(destination, paymentAmount);
+  } else {
+    let changes = await collectChangeAllowingAssets(provider, wallet, amount/* + 2_000_000n*/);
+    for (const change of changes) {
+      console.log(change.input().transactionId());
+      console.log(change.input().index());
+      tx.addInput(change);
+    }
+    tx.payAssets(destination, new Core.Value(amount));
+  }
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+  
+  if (argv.forceSubmit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    await blaze.submitTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    console.log("Submitted");
+  } else if (argv.submit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    const response = await prompt("Type 'submit' to submit");
+    if (response == "submit") {
+      await blaze.submitTransaction(completed);
+      console.log("Submitted");
+    }
+  } else {
+    console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
+  }
+}
+
 let argv = minimist(process.argv.slice(2));
 if (argv.buildUpdateFeeManager) {
   await updateFeeManager(argv);
@@ -3178,7 +3451,16 @@ if (argv.buildUpdateFeeManager) {
 } else if (argv.autoWithdrawRewards) {
   let { blaze, provider } = await setupBlaze(argv);
   let opts = makeAutoWithdrawOptions(argv, blaze, provider);
-  await autoWithdrawRewards(opts);
+  let withdrawnChange = await autoWithdrawRewards(opts);
+  for (let change of withdrawnChange) {
+    let amount = change.output().amount();
+    console.log(`ADA: ${amount.coin()}`);
+    if (amount.multiasset()) {
+      for (const [asset, quantity] of amount.multiasset()) {
+        console.log(`'${asset}': ${quantity}`);
+      }
+    }
+  }
 } else if (argv.testAutoWithdraw) {
   await testAutoWithdraw(argv);
 } else if (argv.doPayouts) {
@@ -3191,6 +3473,8 @@ if (argv.buildUpdateFeeManager) {
   await withdrawGenericStake(argv);
 } else if (argv.withdrawPoolStakeRewards) {
   await withdrawPoolStakeRewards(argv);
+} else if (argv.makePayment) {
+  await makePayment(argv);
 }
 
 process.exit(0);
