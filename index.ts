@@ -74,7 +74,8 @@ import {
 
 import minimist from "minimist";
 
-import { EContractVersion, QueryProviderSundaeSwap, SundaeSDK } from "@sundaeswap/core";
+import { EContractVersion, EDatumType, EContractVersion, QueryProviderSundaeSwap, SundaeSDK, DatumBuilderV3, SwapConfig, ESwapType } from "@sundaeswap/core";
+import { AssetAmount } from "@sundaeswap/asset";
 
 function valueIsZero(v: Value) {
   let coreValue = v.toCore();
@@ -314,6 +315,27 @@ class Multiasset {
     return [coin, result];
   }
 
+  public toJSON(): string {
+    let [coin, ma] = this.unwrap();
+    let obj = { "": String(coin) };
+    for (let [asset, quantity] of ma) {
+      obj[asset] = String(quantity);
+    }
+    return JSON.stringify(obj);
+  }
+
+  public static fromJSON(s: string): Multiasset {
+    let ret = new Multiasset();
+    let o = JSON.parse(s);
+    if (typeof(o) != "object") {
+      throw new Error("expected object");
+    }
+    for (let [asset, quantity] of Object.entries(o)) {
+      ret.addAsset(asset, BigInt(quantity));
+    }
+    return ret;
+  }
+
   public toCoreValue(): Core.Value {
     let [coin, ma] = this.unwrap();
     let output = new Core.Value(coin);
@@ -327,7 +349,40 @@ class Multiasset {
     }
   }
 }
- 
+
+// Collect all utxos in the wallet whose only native asset is the one supplied
+async function collectChangeSingleAsset(provider: Provider, address: Core.Address, asset: string, amount: bigint): Promise<Core.TransactionUnspentOutput[]> {
+  let utxos = await provider.getUnspentOutputs(address);
+  let change = [];
+  let sum = 0n;
+  utxos.sort(compareUtxoByAsset(Core.AssetId(asset)));
+  for (const utxo of utxos) {
+    // Skip utxos that do not contain our desired asset or contain many assets
+    let ma = utxo.output().amount().multiasset();
+    if (ma.size > 1 || !ma.get(asset) || ma.get(asset) == 0) {
+      continue;
+    }
+    // Skip utxos with scripts
+    if (utxo.output().scriptRef()) {
+      continue;
+    }
+    // Skip utxos with datums
+    if (utxo.output().datum()) {
+      continue;
+    }
+    change.push(utxo);
+    sum += BigInt(utxo.output().amount().multiasset().get(Core.AssetId(asset)));
+    if (sum >= amount) {
+      return change;
+    }
+  }
+  throw new Error(`Couldn't find enough change: want ${amount} but only ${sum} is available from among ${change.length} eligible change utxos`);
+}
+
+// Collect all available (non-script, non-datum) change utxos in the wallet
+// until the total value meets the supplied multiasset value. The resulting
+// change set may contain extraneous assets. Tries to optimize somewhat by
+// picking the largest available utxos for each needed asset.
 async function collectChangeMa(provider: Provider, address: Core.Address, multiasset: Multiasset): Promise<Core.TransactionUnspentOutput[]> {
   let utxos = await provider.getUnspentOutputs(address);
   for (let utxo of utxos) {
@@ -1859,7 +1914,9 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
     PlutusData.fromCbor(poolManageRedeemer)
   );
 
-  let coinA = assetClassToAssetId(newPoolDatum.assetPair[0]);
+  let coinA = assetClassIsAda(newPoolDatum.assetPair[0])
+    ? undefined
+    : assetClassToAssetId(newPoolDatum.assetPair[0]);
   let coinB = assetClassToAssetId(newPoolDatum.assetPair[1]);
 
   let newPoolValue = new Core.Value(targetPool.output().amount().coin());
@@ -1871,7 +1928,7 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   if (assetClassIsAda(newPoolDatum.assetPair[0])) {
     poolADAReduction += withdrawnAmountA;
   } else {
-    newPoolValueMa.set(coinA, (newPoolValueMa.get(coinA) ?? 0n) - withdrawnAmountA);
+    newPoolValueMa.set(coinA!, (newPoolValueMa.get(coinA!) ?? 0n) - withdrawnAmountA);
   }
   newPoolValueMa.set(coinB, (newPoolValueMa.get(coinB) ?? 0n) - withdrawnAmountB);
   newPoolValue.setCoin(newPoolValue.coin() - poolADAReduction);
@@ -1890,7 +1947,7 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
     treasuryAmount.setCoin(treasuryAmount.coin() + treasuryAmountA);
   } else {
     if (treasuryAmountA > 0n) {
-      treasuryAmountMa.set(coinA, treasuryAmountA);
+      treasuryAmountMa.set(coinA!, treasuryAmountA);
     }
   }
   if (treasuryAmountB > 0n) {
@@ -1918,7 +1975,7 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
     withheldAmount.setCoin(withheldAmount.coin() + withheldA);
   } else {
     if (withheldA > 0n) {
-      withheldAmountMa.set(coinA, withheldA);
+      withheldAmountMa.set(coinA!, withheldA);
     }
   }
   if (withheldB > 0n) {
@@ -2437,7 +2494,7 @@ async function doPayouts(options: PayoutOptions) {
     todo: { pools: protocolFeesTodo, change: protocolFeesChange },
   };
 
-  let protocolFeesChangeUtxos = await autoWithdrawRewards(autoWithdrawOptions);
+  let { change: protocolFeesChangeUtxos } = await autoWithdrawRewards(autoWithdrawOptions);
 
   console.log(`withdraw generic staking rewards for ${options.genericStakeAddress.toBech32()}`);
   
@@ -3257,6 +3314,7 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
   }
 
   let withdrawnChange = [];
+  let rewards = [];
 
   for (let i = 0; i < todo.length; i++) {
     let thisChange = change[i];
@@ -3322,6 +3380,7 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
       });
       let outs = getOutputs(tx.body());
       withdrawnChange.push(outs[2], outs[3]);
+      rewards.push(outs[2]);
     } else if (options.submit) {
       let retry = true;
       let tx = undefined;
@@ -3349,6 +3408,7 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
       }
       let outs = getOutputs(tx.body());
       withdrawnChange.push(outs[2], outs[3]);
+      rewards.push(outs[2]);
     } else {
       let tx = undefined;
       if (options.stable) {
@@ -3358,6 +3418,7 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
       }
       let outs = getOutputs(tx.body());
       withdrawnChange.push(outs[2], outs[3]);
+      rewards.push(outs[2]);
       console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
       if (options.txLogDir) {
         let txid = tx.getId();
@@ -3367,7 +3428,10 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
     totalWithdrawn += todo[i].amount;
     console.log(`Total withdrawn so far: ${totalWithdrawn}`);
   }
-  return withdrawnChange;
+  return {
+    change: withdrawnChange,
+    rewards: rewards,
+  };
 }
 
 async function makePayment(argv: any) {
@@ -3431,50 +3495,385 @@ async function makePayment(argv: any) {
   }
 }
 
-let argv = minimist(process.argv.slice(2));
-if (argv.buildUpdateFeeManager) {
-  await updateFeeManager(argv);
-} else if (argv.prepareUpdate) {
-  prepareUpdate(argv);
-} else if (argv.signMessage) {
-  await signMessage(argv);
-} else if (argv.makeRedeemer) {
-  await makeRedeemer(argv);
-} else if (argv.updateAllPoolStakeCredentials) {
-  await updateAllPoolStakeCredentials(argv);
-} else if (argv.updateSinglePoolStakeCredential) {
-  await updateSinglePoolStakeCredential(argv);
-} else if (argv.registerStakeAddress) {
-  await registerStakeAddress(argv);
-} else if (argv.debugConditionedScoop) {
-  await debugConditionedScoop(argv);
-} else if (argv.autoWithdrawRewards) {
+async function payAssets(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
-  let opts = makeAutoWithdrawOptions(argv, blaze, provider);
-  let withdrawnChange = await autoWithdrawRewards(opts);
-  for (let change of withdrawnChange) {
-    let amount = change.output().amount();
-    console.log(`ADA: ${amount.coin()}`);
-    if (amount.multiasset()) {
-      for (const [asset, quantity] of amount.multiasset()) {
-        console.log(`'${asset}': ${quantity}`);
+  const tx = blaze.newTransaction();
+
+  let assetsData = fs.readFileSync(argv.assetsFile, "utf8");
+  let toPay = Multiasset.fromJSON(assetsData);
+  let wallet = Core.addressFromBech32(argv.walletAddress);
+  let destination = Core.addressFromBech32(argv.destination);
+
+  // Add an extra 5 ADA to ensure minutxo is covered
+  toPay.addAsset("", 5_000_000n);
+
+  let changes = await collectChangeMa(provider, wallet, toPay);
+  for (const change of changes) {
+    tx.addInput(change);
+  }
+  let paymentAmount = toPay.toCoreValue();
+  tx.payAssets(destination, paymentAmount);
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+  
+  if (argv.forceSubmit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    await blaze.submitTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    console.log("Submitted");
+  } else if (argv.submit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    const response = await prompt("Type 'submit' to submit");
+    if (response == "submit") {
+      await blaze.submitTransaction(completed);
+      console.log("Submitted");
+    }
+  } else {
+    console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
+  }
+}
+
+export interface BuildSwapOptions {
+  blaze: Blaze<Provider, Wallet>,
+  changeUtxos: Core.TransactionUnspentOutput[],
+  pool: PoolData,
+  walletAddress: Address,
+  swapOfferAmount: BigInt,
+  offeredAsset: string,
+  orderScriptAddress: Address,
+}
+
+function fromDot(asset: string) {
+  return asset.replaceAll(".", "");
+}
+
+async function buildSwap(options: BuildSwapOptions) {
+  const tx = options.blaze.newTransaction();
+
+  for (const change of options.changeUtxos) {
+    tx.addInput(change);
+  }
+
+  let swapType = { type: ESwapType.MARKET, slippage: 0.03 };
+  let offeredAsset = options.offeredAsset;
+  if (offeredAsset != options.pool.assetA.assetId && offeredAsset != options.pool.assetB.assetId) {
+    throw new Error(`offered asset ${offeredAsset} is neither of the assets in the pool's coin pair (${options.pool.assetA.assetId}, ${options.pool.assetB.assetId})`);
+  }
+  let sup = new AssetAmount(
+      options.swapOfferAmount,
+      { assetId: offeredAsset, decimals: 6 },
+  );
+  let swapArgs = {
+    suppliedAsset: sup,
+    swapType,
+    pool: options.pool,
+    orderAddresses: {
+      DestinationAddress: { address: options.walletAddress.toBech32(), datum: { type: EDatumType.NONE }, },
+    },
+  };
+
+  let config = new SwapConfig(swapArgs);
+  let { pool, orderAddresses, suppliedAsset, minReceivable, referralFee } = config.buildArgs();
+
+  let datumBuilder = new DatumBuilderV3();
+  let { inline } = datumBuilder.buildSwapDatum({
+    ident: pool.ident,
+    destinationAddress: orderAddresses.DestinationAddress,
+    ownerAddress: options.walletAddress.toBech32(),
+    order: { minReceived: minReceivable, offered: suppliedAsset },
+    scooperFee: 2_500_000,
+  });
+
+  let lockedValue = new Core.Value(4500000);
+  if (offeredAsset == "ada.lovelace") {
+    lockedValue.setCoin(BigInt(lockedValue.coin()) + options.swapOfferAmount);
+  } else {
+    let lockedValueMa = new Map();
+    lockedValueMa.set(fromDot(offeredAsset), options.swapOfferAmount);
+    lockedValue.setMultiasset(lockedValueMa);
+  }
+
+  tx.lockAssets(
+    options.orderScriptAddress,
+    lockedValue,
+    Core.PlutusData.fromCbor(Core.HexBlob(inline)),
+  );
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+
+  return tx;
+}
+
+function getBestPool(pools: PoolData[]) {
+  if (pools.length == 0) {
+    throw new Error("No pools");
+  }
+  // Get best pool by comparing quantity of asset A reserve
+  let bestPool = undefined;
+  for (let pool of pools) {
+    if (pool.version != EContractVersion.V3) {
+      continue;
+    }
+    if (!bestPool) {
+      bestPool = pool;
+    } else {
+      if (pool.liquidity.aReserve > bestPool.liquidity.aReserve) {
+        bestPool = pool;
       }
     }
   }
-} else if (argv.testAutoWithdraw) {
-  await testAutoWithdraw(argv);
-} else if (argv.doPayouts) {
-  await payouts(argv);
-} else if (argv.doPayout) {
-  await doPayout(argv);
-} else if (argv.makeChangeUtxos) {
-  await makeChangeUtxos(argv);
-} else if (argv.withdrawGenericStake) {
-  await withdrawGenericStake(argv);
-} else if (argv.withdrawPoolStakeRewards) {
-  await withdrawPoolStakeRewards(argv);
-} else if (argv.makePayment) {
-  await makePayment(argv);
+  return bestPool;
 }
 
-process.exit(0);
+// Given an asset, find all pools A and B such that
+//   A has pair (asset, otherAsset), and
+//   B has pair (ada, otherAsset)
+async function findChainedPathToAda(queryProvider: QueryProvider, asset: string) {
+  let poolsHavingAsset = await queryProvider.findPoolDataByAssetId(asset);
+  let poolsHavingAda = await queryProvider.findPoolDataByAssetId("ada.lovelace");
+
+  let links = new Map();
+  for (let poolHavingAda of poolsHavingAda) {
+    links.set(poolHavingAda.assetB, poolHavingAda);
+  }
+
+  let candidates = [];
+  for (let poolHavingAsset of poolsHavingAsset) {
+    let otherAsset = poolHavingAsset.assetA;
+    if (poolHavingAsset.assetA == asset) {
+      otherAsset = poolHavingAsset.assetB;
+    }
+    let adaLink = links.get(poolHavingAsset.otherAsset);
+    if (adaLink) {
+      candidates.push([poolHavingAsset, adaLink]);
+    }
+  }
+
+  // TODO: How to choose a best candidate? 
+
+  if (candidates.length == 0) {
+    throw new Error("Couldn't find a path to trade this asset to ada");
+  }
+}
+
+async function convertAssets(argv: any) {
+  let { blaze, provider } = await setupBlaze(argv);
+
+  let assetsData = fs.readFileSync(argv.assetsFile, "utf8");
+  let wallet = Core.addressFromBech32(argv.walletAddress);
+
+  let queryProvider;
+  if (argv.mainnet) {
+    queryProvider = new QueryProviderSundaeSwap("mainnet");
+  } else {
+    queryProvider = new QueryProviderSundaeSwap("preview");
+  }
+
+  let assetsToConvert = JSON.parse(assetsData);
+
+  let adaChange = await findChangeMany(provider, wallet, 7_000_000n, Object.keys(assetsToConvert).length);
+
+  let i = 0;
+  for (let [asset, amount] of Object.entries(assetsToConvert)) {
+    // Doesn't make sense to convert ADA to ADA
+    if (asset == "" || asset == "ada.lovelace") {
+      continue;
+    }
+
+    let pools = await queryProvider.findPoolDataByAssetPair(
+      "ada.lovelace",
+      asset,
+    );
+
+    let bestPool = getBestPool(pools);
+
+    // The ada change utxos are disjoint from the native asset change utxos
+    // because findChangeMany excludes utxos with native assets, while
+    // collectChangeMa only includes utxos having the desired asset.
+    // However, calling collectChangeMa for asset X may choose utxos with
+    // extraneous native assets, which may include asset Y that we also want to
+    // convert.
+    // The solution is to only collect native asset change utxos that contain
+    // only the native asset and ada. This is disjoint per asset and also
+    // disjoint from the pure adaChange set.
+    let uniqueAdaChange = adaChange[i];
+    let nativeAssetChange = await collectChangeSingleAsset(provider, wallet, fromDot(asset), amount);
+
+    console.log(`ASSET: ${asset}`);
+   
+    let tx = await buildSwap({
+      blaze: blaze,
+      pool: bestPool,
+      changeUtxos: [uniqueAdaChange, ...nativeAssetChange],
+      offeredAsset: asset,
+      walletAddress: wallet,
+      swapOfferAmount: BigInt(amount),
+      orderScriptAddress: Core.addressFromBech32(argv.orderScriptAddress),
+    });
+    
+    console.log(`tx: ${tx.toCbor()}`);
+
+    i++;
+  }
+}
+
+async function doSwap(argv: any) {
+  let { blaze, provider } = await setupBlaze(argv);
+
+  let toPay = new Multiasset(); 
+  toPay.addAsset("", 4_500_000n + BigInt(argv.swapOfferAmount));
+
+  let wallet = Core.addressFromBech32(argv.walletAddress);
+
+  let changes = await collectChangeMa(provider, wallet, toPay);
+
+  let queryProvider = new QueryProviderSundaeSwap("mainnet");
+  let pools = await queryProvider.findPoolDataByAssetPair(
+    argv.assetA,
+    argv.assetB,
+  );
+  if (pools.length == 0) {
+    throw new Error("Couldn't find pool for this asset pair");
+  }
+
+  // Get best pool by comparing quantity of asset A reserve
+  let bestPool = undefined;
+  for (let pool of pools) {
+    if (pool.version != EContractVersion.V3) {
+      continue;
+    }
+    if (!bestPool) {
+      bestPool = pool;
+    } else {
+      if (pool.liquidity.aReserve > bestPool.liquidity.aReserve) {
+        bestPool = pool;
+      }
+    }
+  }
+
+  let tx = await buildSwap({
+    blaze: blaze,
+    pool: bestPool,
+    changeUtxos: changes,
+    walletAddress: wallet,
+    swapOfferAmount: BigInt(argv.swapOfferAmount),
+    offeredAsset: argv.assetA,
+    orderScriptAddress: Core.addressFromBech32(argv.orderScriptAddress),
+  });
+  
+  if (argv.forceSubmit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    await blaze.submitTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    console.log("Submitted");
+  } else if (argv.submit) {
+    let completed = await tx.complete();
+    await blaze.signTransaction(completed);
+    console.log(`${completed.toCbor()}`);
+    const response = await prompt("Type 'submit' to submit");
+    if (response == "submit") {
+      await blaze.submitTransaction(completed);
+      console.log("Submitted");
+    }
+  } else {
+    console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
+    let completed = await tx.complete();
+    console.log(`(Completed tx: ${completed.toCbor()})`);
+  }
+}
+
+// Given a file describing amounts of various assets in a wallet, swap each of
+// those assets to ada. This is useful after withdrawing the rewards from the
+// stable pools, since stable pools can have fees in non-ada assets.
+async function swapAssetsToAda(argv) {
+  let query;
+  if (argv.mainnet) {
+    query = new QueryProviderSundaeSwap("mainnet");
+  } else {
+    query = new QueryProviderSundaeSwap("preview");
+  }
+  //let pools = await query.findPoolDataByAssetPair("", "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d77.53554e444145");
+  let pools = await query.findPoolDataByAssetPair("", "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378");
+  if (!pools || pools.length == 0) {
+    console.log(`No pools found`);
+  }
+  for (let pool of pools) {
+    console.log(`Pool found: ${pool.ident}`);
+  }
+}
+
+if (import.meta.main) {
+  let argv = minimist(process.argv.slice(2));
+  if (argv.buildUpdateFeeManager) {
+    await updateFeeManager(argv);
+  } else if (argv.prepareUpdate) {
+    prepareUpdate(argv);
+  } else if (argv.signMessage) {
+    await signMessage(argv);
+  } else if (argv.makeRedeemer) {
+    await makeRedeemer(argv);
+  } else if (argv.updateAllPoolStakeCredentials) {
+    await updateAllPoolStakeCredentials(argv);
+  } else if (argv.updateSinglePoolStakeCredential) {
+    await updateSinglePoolStakeCredential(argv);
+  } else if (argv.registerStakeAddress) {
+    await registerStakeAddress(argv);
+  } else if (argv.debugConditionedScoop) {
+    await debugConditionedScoop(argv);
+  } else if (argv.autoWithdrawRewards) {
+    let { blaze, provider } = await setupBlaze(argv);
+    let opts = makeAutoWithdrawOptions(argv, blaze, provider);
+    let { rewards } = await autoWithdrawRewards(opts);
+    let totalWithdrawn = new Multiasset();
+    for (let change of rewards) {
+      let amount = change.output().amount();
+      totalWithdrawn.addAsset("", amount.coin());
+      if (amount.multiasset()) {
+        for (const [asset, quantity] of amount.multiasset()) {
+          totalWithdrawn.addAsset(asset, quantity);
+        }
+      }
+    }
+    await Bun.write(argv.rewardsOut, totalWithdrawn.toJSON());
+  } else if (argv.testAutoWithdraw) {
+    await testAutoWithdraw(argv);
+  } else if (argv.doPayouts) {
+    await payouts(argv);
+  } else if (argv.doPayout) {
+    await doPayout(argv);
+  } else if (argv.makeChangeUtxos) {
+    await makeChangeUtxos(argv);
+  } else if (argv.withdrawGenericStake) {
+    await withdrawGenericStake(argv);
+  } else if (argv.withdrawPoolStakeRewards) {
+    await withdrawPoolStakeRewards(argv);
+  } else if (argv.makePayment) {
+    await makePayment(argv);
+  } else if (argv.payAssets) {
+    await payAssets(argv);
+  } else if (argv.doSwap) {
+    await doSwap(argv);
+  } else if (argv.convertAssets) {
+    await convertAssets(argv);
+  }
+
+  process.exit(0);
+}
