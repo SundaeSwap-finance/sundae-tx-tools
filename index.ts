@@ -3553,9 +3553,151 @@ export interface BuildSwapOptions {
   orderScriptAddress: Address,
 }
 
+export interface BuildChainedSwapOptions {
+  blaze: Blaze<Provider, Wallet>,
+  changeUtxos: Core.TransactionUnspentOutput[],
+  pool1: PoolData,
+  pool2: PoolData,
+  walletAddress: Address,
+  swapOfferAmount: BigInt,
+  offeredAsset: string,
+  orderScriptAddress: Address,
+}
+
 function fromDot(asset: string) {
   return asset.replaceAll(".", "");
 }
+
+async function buildChainedSwap(options: BuildChainedSwapOptions) {
+  const tx = options.blaze.newTransaction();
+
+  for (const change of options.changeUtxos) {
+    tx.addInput(change);
+  }
+
+  let swapType = { type: ESwapType.MARKET, slippage: 0.03 };
+  let offeredAsset = options.offeredAsset;
+ 
+  let otherAsset = undefined;
+  let isAtoB = true;
+  if (offeredAsset == options.pool1.assetA.assetId) {
+    otherAsset = options.pool1.assetB.assetId;
+  } else if (offeredAsset == options.pool1.assetB.assetId) {
+    otherAsset = options.pool1.assetA.assetId;
+    isAtoB = false;
+  } else { 
+    throw new Error(`offered asset ${offeredAsset} is neither of the assets in the pool's coin pair (${options.pool.assetA.assetId}, ${options.pool.assetB.assetId})`);
+  }
+
+  if (otherAsset != options.pool2.assetA.assetId && otherAsset != options.pool2.assetB.assetId) {
+    throw new Error(`pool of second leg of chained swap does not match contain the other asset of the first pool`);
+  }
+
+  // Estimate the amount of otherAsset recieved for the offered amount of
+  // offeredAsset
+  let estimatedSwapReturn = undefined;
+
+  if (options.pool1.version == EContractVersion.V3) {
+    //  pool_take * difference * order_give / (
+    //    pool_give * 10000 + order_give * difference
+    //  )
+    let orderGive = options.swapOfferAmount;
+    let poolTake = undefined;
+    let poolGive = undefined;
+    let difference = options.pool1.protocolFee;
+    if (isAtoB) {
+      poolTake = options.pool1.liquidity.bReserve;
+      poolGive = options.pool1.liquidity.aReserve;
+    } else {
+      poolTake = options.pool1.liquidity.aReserve;
+      poolGive = options.pool1.liquidity.bReserve;
+    }
+    estimatedSwapReturn =
+      poolTake * (1 - fee) * orderGive / (poolGive + orderGive * (1 - fee));
+  } else if (options.pool1.version == EContractVersion.StableSwap) {
+    // FIXME
+  }
+
+  // Build the datum of the second leg, first
+  let sup2 = new AssetAmount(
+      estimatedSwapReturn,
+      { assetId: otherAsset, decimals: 6 },
+  );
+  let swap2Args = {
+    suppliedAsset: sup2,
+    swapType,
+    pool: options.pool2,
+    orderAddresses: {
+      DestinationAddress: { address: options.walletAddress.toBech32(), datum: { type: EDatumType.NONE }, },
+    },
+  };
+
+  let config2 = new SwapConfig(swap2Args);
+  let { pool, orderAddresses, suppliedAsset, minReceivable, referralFee } = config2.buildArgs();
+
+  let datumBuilder = new DatumBuilderV3();
+  let { inline2 } = datumBuilder.buildSwapDatum({
+    ident: pool2.ident,
+    destinationAddress: orderAddresses.DestinationAddress,
+    ownerAddress: options.walletAddress.toBech32(),
+    order: { minReceived: minReceivable, offered: suppliedAsset },
+    scooperFee: 2_500_000,
+  });
+
+  // Now build the datum of the first leg, embedding the second leg's datum
+  let sup1 = new AssetAmount(
+      options.swapOfferAmount,
+      { assetId: offeredAsset, decimals: 6 },
+  );
+  let swap1Args = {
+    suppliedAsset: sup1,
+    swapType,
+    pool: options.pool1,
+    orderAddresses: {
+      DestinationAddress: { address: options.orderScriptAddress.toBech32(), datum: { type: EDatumType.Inline, bytes: inline2 }, },
+    },
+  };
+
+  let config1 = new SwapConfig(swap1Args);
+  let { pool, orderAddresses, suppliedAsset, minReceivable, referralFee } = config1.buildArgs();
+
+  let datumBuilder = new DatumBuilderV3();
+  let { inline1 } = datumBuilder.buildSwapDatum({
+    ident: pool1.ident,
+    destinationAddress: orderAddresses.DestinationAddress,
+    ownerAddress: options.walletAddress.toBech32(),
+    order: { minReceived: minReceivable, offered: suppliedAsset },
+    scooperFee: 2_500_000,
+  });
+
+  let lockedValue = new Core.Value(7000000);
+  if (offeredAsset == "ada.lovelace") {
+    lockedValue.setCoin(BigInt(lockedValue.coin()) + options.swapOfferAmount);
+  } else {
+    let lockedValueMa = new Map();
+    lockedValueMa.set(fromDot(offeredAsset), options.swapOfferAmount);
+    lockedValue.setMultiasset(lockedValueMa);
+  }
+
+  tx.lockAssets(
+    options.orderScriptAddress,
+    lockedValue,
+    Core.PlutusData.fromCbor(Core.HexBlob(inline1)),
+  );
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+
+  return tx;
+}
+
+
 
 async function buildSwap(options: BuildSwapOptions) {
   const tx = options.blaze.newTransaction();
@@ -3679,6 +3821,9 @@ async function convertAssets(argv: any) {
   let assetsData = fs.readFileSync(argv.assetsFile, "utf8");
   let wallet = Core.addressFromBech32(argv.walletAddress);
 
+  let preferredPoolsJson = fs.readFileSync(argv.preferredPoolsFile, "utf8");
+  let preferredPools = JSON.parse(preferredPoolsJson);
+
   let queryProvider;
   if (argv.mainnet) {
     queryProvider = new QueryProviderSundaeSwap("mainnet");
@@ -3697,12 +3842,23 @@ async function convertAssets(argv: any) {
       continue;
     }
 
-    let pools = await queryProvider.findPoolDataByAssetPair(
-      "ada.lovelace",
-      asset,
+    if (!preferredPools[asset]) {
+      throw new Error(`No preferred pools entry was provided for this asset (${asset})`);
+    }
+    let pools1 = await queryProvider.findPoolDataByIdent(
+      preferredPools[asset].pool1
     );
-
-    let bestPool = getBestPool(pools);
+    if (!pools1.length != 1) {
+      throw new Error(`Failed to find pool by ident (${preferredPools[asset].pool1})`);
+    }
+    let pool1 = pools1[0];
+    let pools2 = await queryProvider.findPoolDataByIdent(
+      preferredPools[asset].pool2
+    );
+    if (!pools2.length != 1) {
+      throw new Error(`Failed to find pool by ident (${preferredPools[asset].pool2})`);
+    }
+    let pool2 = pools2[0];
 
     // The ada change utxos are disjoint from the native asset change utxos
     // because findChangeMany excludes utxos with native assets, while
@@ -3718,9 +3874,10 @@ async function convertAssets(argv: any) {
 
     console.log(`ASSET: ${asset}`);
    
-    let tx = await buildSwap({
+    let tx = await buildChainedSwap({
       blaze: blaze,
-      pool: bestPool,
+      pool1: pool1,
+      pool2: pool2,
       changeUtxos: [uniqueAdaChange, ...nativeAssetChange],
       offeredAsset: asset,
       walletAddress: wallet,
