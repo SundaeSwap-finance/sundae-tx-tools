@@ -77,6 +77,8 @@ import minimist from "minimist";
 import { EContractVersion, EDatumType, EContractVersion, QueryProviderSundaeSwap, SundaeSDK, DatumBuilderV3, SwapConfig, ESwapType } from "@sundaeswap/core";
 import { AssetAmount } from "@sundaeswap/asset";
 
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 function valueIsZero(v: Value) {
   let coreValue = v.toCore();
   if (coreValue.assets) {
@@ -267,6 +269,10 @@ class Multiasset {
   public constructor() {
     this.ma = new Map();
   }
+
+  public isEmpty() {
+    return this.ma.size == 0;
+  }
   
   public get(a: string) {
     let q = this.ma.get(a);
@@ -277,7 +283,24 @@ class Multiasset {
     }
   }
 
-  public addAsset(a: string, amount: bigint) {
+  // cardano-js-sdk assetId is "normalized" i.e. the concatenation of the hex
+  // policy id and the hex asset name without a dot separator. so we use the same
+  // convention
+  public normalizeAsset(value: string): string {
+    const normalizedValue = value.split('.').join('');
+    if (normalizedValue.length > 0 && !/^[\da-f]+$/i.test(normalizedValue)) {
+      throw new Error('normalizeAsset: expected hex string');
+    }
+    if (normalizedValue.length % 2 != 0) {
+      throw new Error('normalizeAsset: odd length of asset');
+    }
+    if (normalizedValue.length > 120) throw new Error('normalizeAsset: asset longer than 120');
+    if (normalizedValue.length < 56) throw new Error('normalizeAsset: asset shorter than 56');
+    return normalizedValue;
+  }
+
+  public addAsset(aRaw: string, amount: bigint) {
+    let a = this.normalizeAsset(aRaw);
     let q = this.ma.get(a);
     if (q) {
       this.ma.set(a, q + amount);
@@ -336,6 +359,17 @@ class Multiasset {
     return ret;
   }
 
+  public addCardanoSdkValue(value: Core.Value) {
+    this.addAsset("", value.coin());
+    let ma = value.multiasset();
+    if (!ma) {
+      return;
+    }
+    for (let [assetId, amount] of ma) {
+      this.addAsset(assetId, amount);
+    }
+  }
+
   public toCoreValue(): Core.Value {
     let [coin, ma] = this.unwrap();
     let output = new Core.Value(coin);
@@ -350,26 +384,48 @@ class Multiasset {
   }
 }
 
-// Collect all utxos in the wallet whose only native asset is the one supplied
-async function collectChangeSingleAsset(provider: Provider, address: Core.Address, asset: string, amount: bigint): Promise<Core.TransactionUnspentOutput[]> {
+// Collect utxos in the wallet containing the supplied asset until the amount is
+// met. Utxos whose only native asset is the one supplied are preferred, but
+// utxos with other native assets are used if needed (the extraneous assets are
+// returned as change). Utxos in `used` are skipped, and the chosen utxos are
+// added to it, so that repeated calls choose disjoint utxos. Utxos with datums
+// are skipped unless the datum is an inline bytestring in `allowedDatums` (hex),
+// e.g. the payout of a swap order we placed.
+async function collectChangeSingleAsset(provider: Provider, address: Core.Address, asset: string, amount: bigint, used: Set<string> = new Set(), allowedDatums: Set<string> = new Set()): Promise<Core.TransactionUnspentOutput[]> {
   let utxos = await provider.getUnspentOutputs(address);
-  let change = [];
-  let sum = 0n;
-  utxos.sort(compareUtxoByAsset(Core.AssetId(asset)));
-  for (const utxo of utxos) {
-    // Skip utxos that do not contain our desired asset or contain many assets
+  utxos = utxos.filter(utxo => {
+    // Skip utxos that do not contain our desired asset
     let ma = utxo.output().amount().multiasset();
-    if (ma.size > 1 || !ma.get(asset) || ma.get(asset) == 0) {
-      continue;
+    if (!ma || !ma.get(asset)) {
+      return false;
     }
     // Skip utxos with scripts
     if (utxo.output().scriptRef()) {
-      continue;
+      return false;
     }
-    // Skip utxos with datums
-    if (utxo.output().datum()) {
-      continue;
+    // Skip utxos with datums, other than explicitly allowed ones
+    let datum = utxo.output().datum();
+    if (datum) {
+      let bytes = datum.asInlineData()?.asBoundedBytes();
+      if (!bytes || !allowedDatums.has(bytes.toHex())) {
+        return false;
+      }
     }
+    return !used.has(txref(utxo));
+  });
+  let byAmount = compareUtxoByAsset(Core.AssetId(asset));
+  utxos.sort((a, b) => {
+    let aSingle = a.output().amount().multiasset()!.size == 1;
+    let bSingle = b.output().amount().multiasset()!.size == 1;
+    if (aSingle != bSingle) {
+      return aSingle ? -1 : 1;
+    }
+    return byAmount(a, b);
+  });
+  let change = [];
+  let sum = 0n;
+  for (const utxo of utxos) {
+    used.add(txref(utxo));
     change.push(utxo);
     sum += BigInt(utxo.output().amount().multiasset().get(Core.AssetId(asset)));
     if (sum >= amount) {
@@ -1228,6 +1284,27 @@ function makeChange(myAddress: Address, amount: bigint): Core.TransactionUnspent
     new Core.TransactionUnspentOutput(input, output);
 
   return utxo;
+}
+
+export function makeTokenChange(myAddress: Address, txId: string, index: bigint, asset: string, amount: bigint): Core.TransactionUnspentOutput {
+  let input =
+    new Core.TransactionInput(
+      Core.TransactionId(txId),
+      index,
+    );
+
+  let output =
+    new Core.TransactionOutput(
+      myAddress,
+      new Core.Value(
+        2_000_000n,
+        new Map([
+          [Core.AssetId(asset), amount],
+        ])
+      ),
+    );
+
+  return new Core.TransactionUnspentOutput(input, output);
 }
 
 function multisigSignature(keyHash: Ed25519KeyHash): MultisigSignature {
@@ -2327,15 +2404,68 @@ async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, buildTx: 
   }
 }
 
-function readSigningKeyFile(filepath: string): string {
+type SigningKey =
+  | { kind: "normal", hex: string }
+  | { kind: "extended", key: Core.Ed25519PrivateKey };
+
+// Accepts both normal (5820) and BIP32 extended (5880, e.g. derived from a mnemonic) cardano-cli signing keys
+function readSigningKeyFile(filepath: string): SigningKey {
   let contents = fs.readFileSync(filepath, "utf8");
   let json = JSON.parse(contents) as { cborHex: string };
   let skeyCbor = json.cborHex;
-  if (skeyCbor.startsWith("5820")) {
-    let skeyHex = skeyCbor.slice(4);
-    return skeyHex;
+  if (skeyCbor.startsWith("5820") && skeyCbor.length == 4 + 64) {
+    return { kind: "normal", hex: skeyCbor.slice(4) };
+  } else if (skeyCbor.startsWith("5880") && skeyCbor.length == 4 + 256) {
+    // cardano-cli layout is kL || kR || public key || chain code; signing only needs kL || kR
+    let extendedHex = skeyCbor.slice(4, 4 + 128);
+    return { kind: "extended", key: Core.Ed25519PrivateKey.fromExtendedHex(Core.Ed25519PrivateExtendedKeyHex(extendedHex)) };
   } else {
     throw new Error("readSigningKeyFile: invalid cbor signing key");
+  }
+}
+
+// HotSingleWallet treats its key as a normal ed25519 seed, which yields the wrong public key for
+// extended keys, so sign with the extended key directly and reuse ColdWallet for everything else
+class ExtendedKeyWallet extends ColdWallet {
+  private signingKey: Core.Ed25519PrivateKey;
+  private publicKey: Core.Ed25519PublicKey;
+
+  private constructor(signingKey: Core.Ed25519PrivateKey, publicKey: Core.Ed25519PublicKey, address: Core.Address, networkId: NetworkId, provider: Provider) {
+    super(address, networkId, provider);
+    this.signingKey = signingKey;
+    this.publicKey = publicKey;
+  }
+
+  // Without an address, the wallet uses the key's enterprise address, like HotSingleWallet does
+  static async create(signingKey: Core.Ed25519PrivateKey, networkId: NetworkId, provider: Provider, address?: Core.Address): Promise<ExtendedKeyWallet> {
+    // Extended key operations go through libsodium, which must be initialized first
+    await Core.initCrypto();
+    let publicKey = await signingKey.toPublic();
+    let keyHash = (await publicKey.hash()).hex();
+    if (address) {
+      let paymentPart = address.getProps().paymentPart;
+      if (paymentPart?.type != Core.CredentialType.KeyHash || paymentPart.hash.toString() != keyHash.toString()) {
+        throw new Error(`signing key ${keyHash} does not match payment credential of ${address.toBech32()}`);
+      }
+    } else {
+      address = new Core.Address({
+        type: Core.AddressType.EnterpriseKey,
+        networkId,
+        paymentPart: { type: Core.CredentialType.KeyHash, hash: Core.Hash28ByteBase16(keyHash) },
+      });
+    }
+    return new ExtendedKeyWallet(signingKey, publicKey, address, networkId, provider);
+  }
+
+  async signTransaction(tx: Core.Transaction, partialSign: boolean = true): Promise<Core.TransactionWitnessSet> {
+    if (!partialSign) {
+      throw new Error("signTx: extended key wallet only supports partial signing = true");
+    }
+    let signature = await this.signingKey.sign(Core.HexBlob(tx.getId()));
+    let vkw = new Core.VkeyWitness(this.publicKey.hex(), signature.hex());
+    let tws = new Core.TransactionWitnessSet();
+    tws.setVkeys(Core.CborSet.fromCore([vkw.toCore()], Core.VkeyWitness.fromCore));
+    return tws;
   }
 }
 
@@ -2369,8 +2499,13 @@ export async function setupBlaze(args: any): Promise<{ blaze: Blaze<Provider, Wa
 
   let wallet: Wallet;
   if (skeyFilePath) {
-    let skeyHex = readSigningKeyFile(skeyFilePath);
-    wallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skeyHex), network, provider);
+    let skey = readSigningKeyFile(skeyFilePath);
+    if (skey.kind == "normal") {
+      wallet = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skey.hex), network, provider);
+    } else {
+      let address = args.walletAddress ? Core.addressFromBech32(args.walletAddress) : undefined;
+      wallet = await ExtendedKeyWallet.create(skey.key, network, provider, address);
+    }
   } else {
     wallet = new ColdWallet(Core.addressFromBech32(args.walletAddress), network, provider);
   }
@@ -3551,6 +3686,7 @@ export interface BuildSwapOptions {
   swapOfferAmount: BigInt,
   offeredAsset: string,
   orderScriptAddress: Address,
+  identifier: Uint8Array | undefined,
 }
 
 export interface BuildChainedSwapOptions {
@@ -3633,14 +3769,14 @@ async function buildChainedSwap(options: BuildChainedSwapOptions) {
   };
 
   let config2 = new SwapConfig(swap2Args);
-  let { pool, orderAddresses, suppliedAsset, minReceivable, referralFee } = config2.buildArgs();
+  let { pool22, orderAddresses2, suppliedAsset2, minReceivable2 } = config2.buildArgs();
 
   let datumBuilder = new DatumBuilderV3();
   let { inline2 } = datumBuilder.buildSwapDatum({
-    ident: pool2.ident,
-    destinationAddress: orderAddresses.DestinationAddress,
+    ident: pool22.ident,
+    destinationAddress: orderAddresses2.DestinationAddress,
     ownerAddress: options.walletAddress.toBech32(),
-    order: { minReceived: minReceivable, offered: suppliedAsset },
+    order: { minReceived: minReceivable2, offered: suppliedAsset2 },
     scooperFee: 2_500_000,
   });
 
@@ -3659,9 +3795,8 @@ async function buildChainedSwap(options: BuildChainedSwapOptions) {
   };
 
   let config1 = new SwapConfig(swap1Args);
-  let { pool, orderAddresses, suppliedAsset, minReceivable, referralFee } = config1.buildArgs();
+  let { pool, orderAddresses, suppliedAsset, minReceivable } = config1.buildArgs();
 
-  let datumBuilder = new DatumBuilderV3();
   let { inline1 } = datumBuilder.buildSwapDatum({
     ident: pool1.ident,
     destinationAddress: orderAddresses.DestinationAddress,
@@ -3715,12 +3850,23 @@ async function buildSwap(options: BuildSwapOptions) {
       options.swapOfferAmount,
       { assetId: offeredAsset, decimals: 6 },
   );
+
+  // DatumBuilderV3 mis-serializes inline destination datums (they come out as
+  // the integer 1), so we build with no destination datum and patch the
+  // identifier in afterwards with withDestinationInlineDatum.
+  let destinationAddress = {
+    address: options.walletAddress.toBech32(),
+    datum: {
+      type: EDatumType.NONE,
+    },
+  };
+
   let swapArgs = {
     suppliedAsset: sup,
     swapType,
     pool: options.pool,
     orderAddresses: {
-      DestinationAddress: { address: options.walletAddress.toBech32(), datum: { type: EDatumType.NONE }, },
+      DestinationAddress: destinationAddress,
     },
   };
 
@@ -3745,10 +3891,15 @@ async function buildSwap(options: BuildSwapOptions) {
     lockedValue.setMultiasset(lockedValueMa);
   }
 
+  let orderDatum = Core.PlutusData.fromCbor(Core.HexBlob(inline));
+  if (options.identifier) {
+    orderDatum = withDestinationInlineDatum(orderDatum, Core.PlutusData.newBytes(options.identifier));
+  }
+
   tx.lockAssets(
     options.orderScriptAddress,
     lockedValue,
-    Core.PlutusData.fromCbor(Core.HexBlob(inline)),
+    orderDatum,
   );
 
   tx.useCoinSelector((inputs, dearth) => {
@@ -3761,6 +3912,32 @@ async function buildSwap(options: BuildSwapOptions) {
   });
 
   return tx;
+}
+
+// Replace the destination datum of a V3 order datum with an inline datum.
+// OrderDatum is Constr 0 [pool_ident, owner, max_protocol_fee, destination,
+// details, extension]; a Fixed destination is Constr 0 [address, datum]; and
+// InlineDatum is Constr 2 [data].
+function withDestinationInlineDatum(orderDatum: Core.PlutusData, datum: Core.PlutusData): Core.PlutusData {
+  let replaceField = (constr: Core.ConstrPlutusData, index: number, value: Core.PlutusData) => {
+    let fields = constr.getData();
+    let newFields = new Core.PlutusList();
+    for (let i = 0; i < fields.getLength(); i++) {
+      newFields.add(i == index ? value : fields.get(i));
+    }
+    return Core.PlutusData.newConstrPlutusData(new Core.ConstrPlutusData(constr.getAlternative(), newFields));
+  };
+
+  let order = orderDatum.asConstrPlutusData();
+  let destination = order?.getData().get(3).asConstrPlutusData();
+  if (!order || !destination || destination.getAlternative() != 0n) {
+    throw new Error("Expected a V3 order datum with a fixed destination");
+  }
+  let inlineFields = new Core.PlutusList();
+  inlineFields.add(datum);
+  let inlineDatum = Core.PlutusData.newConstrPlutusData(new Core.ConstrPlutusData(2n, inlineFields));
+  let newDestination = replaceField(destination, 1, inlineDatum);
+  return replaceField(order, 3, newDestination);
 }
 
 function getBestPool(pools: PoolData[]) {
@@ -3815,6 +3992,151 @@ async function findChainedPathToAda(queryProvider: QueryProvider, asset: string)
   }
 }
 
+// Convert a concatenated policy+name asset id into the dotted form used by the
+// SundaeSwap SDK
+function toDot(asset: string) {
+  if (asset == "" || asset == "ada.lovelace" || asset.includes(".")) {
+    return asset;
+  }
+  return `${asset.slice(0, 56)}.${asset.slice(56)}`;
+}
+
+// Pool versions we can build swap orders for. Stableswaps orders have the same
+// datum encoding as V3 orders, but a different order script.
+const SUPPORTED_SWAP_VERSIONS = [EContractVersion.V3, EContractVersion.Stableswaps];
+
+// The order script address for the given protocol version, staked with the
+// owner's stake credential (as the SDK does)
+async function getOrderScriptAddress(queryProvider, version: EContractVersion, network: number, owner: Core.Address): Promise<Core.Address> {
+  let params = await queryProvider.getProtocolParamsWithScripts(version);
+  let orderValidator = params.blueprint.validators.find(v => v.title == "order.spend");
+  if (!orderValidator) {
+    throw new Error(`Couldn't find the ${version} order.spend validator in the protocol params`);
+  }
+  let paymentPart = {
+    hash: Core.Hash28ByteBase16(orderValidator.hash),
+    type: Core.CredentialType.ScriptHash,
+  };
+  let stakeCred = owner.asBase()?.getStakeCredential();
+  if (!stakeCred) {
+    return Core.addressFromCredential(network, Core.Credential.fromCore(paymentPart));
+  }
+  return new Core.Address({
+    type: Core.AddressType.BasePaymentScriptStakeKey,
+    paymentPart,
+    delegationPart: stakeCred,
+    networkId: network,
+  });
+}
+
+// Drop assets whose swap to ada would return less than minReturn lovelace
+// (e.g. a few units of dust left over from a previous swap), since an order
+// that receives nothing can't be scooped
+async function filterDust(queryProvider, preferredPools, assetsToConvert, minReturn: bigint) {
+  let filtered = {};
+  for (let [asset, amount] of Object.entries(assetsToConvert)) {
+    if (asset == "" || asset == "ada.lovelace") {
+      continue;
+    }
+    let ident = preferredPools[fromDot(asset)]?.pool;
+    if (!ident) {
+      throw new Error(`No preferred pools entry was provided for this asset (${asset})`);
+    }
+    let pool = await queryProvider.findPoolDataByIdent({ ident });
+    if (!pool) {
+      throw new Error(`Failed to find pool by ident (${ident})`);
+    }
+    let config = new SwapConfig({
+      suppliedAsset: new AssetAmount(BigInt(amount), { assetId: toDot(asset), decimals: 6 }),
+      swapType: { type: ESwapType.MARKET, slippage: 0.03 },
+      pool,
+      orderAddresses: { DestinationAddress: { address: "", datum: { type: EDatumType.NONE } } },
+    });
+    let { minReceivable } = config.buildArgs();
+    if (minReceivable.amount < minReturn) {
+      console.log(`Skipping dust: ${amount} of ${asset} would return ${minReceivable.amount} (< ${minReturn})`);
+      continue;
+    }
+    filtered[asset] = amount;
+  }
+  return filtered;
+}
+
+async function buildAssetSwaps(blaze, provider, wallet, queryProvider, preferredPools, assetsToConvert, adaChange, orderScriptAddresses: Map<EContractVersion, Core.Address>, settledOrders: Set<string>) {
+  let i = 0;
+  let identifiers = new Set<string>();
+  let txs = [];
+  // Native asset change utxos already claimed by a swap in this batch
+  let usedUtxos = new Set<string>(adaChange.map(txref));
+  for (let [asset, amount] of Object.entries(assetsToConvert)) {
+    // Doesn't make sense to convert ADA to ADA
+    if (asset == "" || asset == "ada.lovelace") {
+      continue;
+    }
+    asset = fromDot(asset);
+
+    if (!preferredPools[asset]) {
+      throw new Error(`No preferred pools entry was provided for this asset (${asset})`);
+    }
+    console.log(`${preferredPools[asset].pool}`);
+    let pool = await queryProvider.findPoolDataByIdent(
+      { ident: preferredPools[asset].pool }
+    );
+    if (!pool) {
+      throw new Error(`Failed to find pool by ident (${preferredPools[asset].pool})`);
+    }
+    if (!SUPPORTED_SWAP_VERSIONS.includes(pool.version)) {
+      throw new Error(`Preferred pool ${pool.ident} for ${asset} is a ${pool.version} pool; only ${SUPPORTED_SWAP_VERSIONS.join(" and ")} pools are supported`);
+    }
+    console.log(`${stringify(pool)}`);
+
+    // The ada change utxos are disjoint from the native asset change utxos
+    // because findChangeMany excludes utxos with native assets, while
+    // collectChangeMa only includes utxos having the desired asset.
+    // However, calling collectChangeMa for asset X may choose utxos with
+    // extraneous native assets, which may include asset Y that we also want to
+    // convert.
+    // The solution is to only collect native asset change utxos that contain
+    // only the native asset and ada. This is disjoint per asset and also
+    // disjoint from the pure adaChange set.
+    let uniqueAdaChange = adaChange[i];
+
+    let nativeAssetChange = await collectChangeSingleAsset(provider, wallet, asset, BigInt(amount), usedUtxos, settledOrders);
+
+    console.log(`ASSET: ${asset}`);
+
+    // A unique identifier for this order. The ada change utxos may share a
+    // transaction id (e.g. if they came from the same fanout), so use random
+    // bytes instead.
+    let identifier = new Uint8Array(randomTxId());
+
+    identifiers.add(identifier.toHex());
+
+    let tx = await buildSwap({
+      blaze: blaze,
+      pool: pool,
+      changeUtxos: [uniqueAdaChange, ...nativeAssetChange],
+      offeredAsset: toDot(asset),
+      walletAddress: wallet,
+      swapOfferAmount: BigInt(amount),
+      orderScriptAddress: orderScriptAddresses.get(pool.version)!,
+      identifier,
+    });
+
+    console.log(`tx: ${tx.toCbor()}`);
+    let completed = await tx.complete();
+    console.log(`tx completed: ${completed.toCbor()}`);
+    txs.push(completed);
+
+    i++;
+  }
+
+  return {
+    txs,
+    identifiers
+  };
+}
+
 async function convertAssets(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
 
@@ -3833,61 +4155,106 @@ async function convertAssets(argv: any) {
 
   let assetsToConvert = JSON.parse(assetsData);
 
-  let adaChange = await findChangeMany(provider, wallet, 7_000_000n, Object.keys(assetsToConvert).length);
+  let orderScriptAddresses = new Map<EContractVersion, Core.Address>();
+  for (let version of SUPPORTED_SWAP_VERSIONS) {
+    let address = await getOrderScriptAddress(queryProvider, version, argv.mainnet ? 1 : 0, wallet);
+    orderScriptAddresses.set(version, address);
+    console.log(`${version} order script address: ${address.toBech32()}`);
+  }
 
-  let i = 0;
-  for (let [asset, amount] of Object.entries(assetsToConvert)) {
-    // Doesn't make sense to convert ADA to ADA
-    if (asset == "" || asset == "ada.lovelace") {
-      continue;
+  let adaEarned = 0n;
+  // Identifiers of all orders settled so far; their payouts may be spent by
+  // later rounds of swaps
+  let settledOrders = new Set<string>();
+  let minSwapReturn = BigInt(argv.minSwapReturn ?? 1);
+  let mustSwap = true;
+  while (mustSwap) {
+    assetsToConvert = await filterDust(queryProvider, preferredPools, assetsToConvert, minSwapReturn);
+    if (Object.keys(assetsToConvert).length == 0) {
+      break;
     }
 
-    if (!preferredPools[asset]) {
-      throw new Error(`No preferred pools entry was provided for this asset (${asset})`);
-    }
-    let pools1 = await queryProvider.findPoolDataByIdent(
-      preferredPools[asset].pool1
-    );
-    if (!pools1.length != 1) {
-      throw new Error(`Failed to find pool by ident (${preferredPools[asset].pool1})`);
-    }
-    let pool1 = pools1[0];
-    let pools2 = await queryProvider.findPoolDataByIdent(
-      preferredPools[asset].pool2
-    );
-    if (!pools2.length != 1) {
-      throw new Error(`Failed to find pool by ident (${preferredPools[asset].pool2})`);
-    }
-    let pool2 = pools2[0];
+    let adaChange = await findChangeMany(provider, wallet, 7_000_000n, Object.keys(assetsToConvert).length);
 
-    // The ada change utxos are disjoint from the native asset change utxos
-    // because findChangeMany excludes utxos with native assets, while
-    // collectChangeMa only includes utxos having the desired asset.
-    // However, calling collectChangeMa for asset X may choose utxos with
-    // extraneous native assets, which may include asset Y that we also want to
-    // convert.
-    // The solution is to only collect native asset change utxos that contain
-    // only the native asset and ada. This is disjoint per asset and also
-    // disjoint from the pure adaChange set.
-    let uniqueAdaChange = adaChange[i];
-    let nativeAssetChange = await collectChangeSingleAsset(provider, wallet, fromDot(asset), amount);
+    // For each asset that we need to convert, build a list-order
+    // swapping that asset to its preferred pool
+    let { txs, identifiers } = await buildAssetSwaps(blaze, provider, wallet, queryProvider, preferredPools, assetsToConvert, adaChange, orderScriptAddresses, settledOrders);
 
-    console.log(`ASSET: ${asset}`);
-   
-    let tx = await buildChainedSwap({
-      blaze: blaze,
-      pool1: pool1,
-      pool2: pool2,
-      changeUtxos: [uniqueAdaChange, ...nativeAssetChange],
-      offeredAsset: asset,
-      walletAddress: wallet,
-      swapOfferAmount: BigInt(amount),
-      orderScriptAddress: Core.addressFromBech32(argv.orderScriptAddress),
-    });
-    
-    console.log(`tx: ${tx.toCbor()}`);
+    mustSwap = false;
+    assetsToConvert = {};
 
-    i++;
+    // Submit all of the asset-swap list-order txes
+    for (let completed of txs) {
+      await blaze.signTransaction(completed);
+      console.log(`${completed.toCbor()}`);
+      const response = await prompt("Type 'submit' to submit");
+      if (response != "submit") {
+        throw new Error("Aborted: not all list-order transactions were submitted");
+      }
+      await blaze.submitTransaction(completed);
+      console.log(`Submitted ${completed.getId()}`);
+    }
+
+    // Wait for all of the list-order txes to settle
+    let awaitedTxs = [];
+    for (let completed of txs) {
+      awaitedTxs.push(provider.awaitTransactionConfirmation(completed.getId(), 300_000));
+    }
+    let confirmations = await Promise.all(awaitedTxs);
+    if (!confirmations.every(c => c === true)) {
+      throw new Error("Not all list-order transactions have settled");
+    }
+    console.log("All list-order transactions confirmed; waiting for scoops");
+
+    // Wait for all datums to appear in the wallet
+    let settledCount = 0;
+    while (true) {
+      let unspentOutputs = await provider.getUnspentOutputs(wallet);
+      for (let utxo of unspentOutputs) {
+        let thisDatum = utxo.output().datum()?.asInlineData()?.asBoundedBytes()?.toHex();
+        if (!thisDatum) {
+          continue;
+        }
+
+        // A new settled order was just discovered; update funds state
+        if (!settledOrders.has(thisDatum) && identifiers.has(thisDatum)) {
+          settledOrders.add(thisDatum);
+          settledCount++;
+          let thisValue = utxo.output().amount();
+
+          // If thisValue is pure ada, then we need to tally the surplus ada
+          // (i.e. the total ada minus rider and fee). Otherwise, there should
+          // be no surplus ada and some native token, and we should add that to
+          // the new assetsToConvert.
+          let riderAndFee = 4_500_000n;
+          let netAda = thisValue.coin() - riderAndFee;
+          adaEarned += netAda;
+          console.log(`Order ${thisDatum} settled in tx ${utxo.input().transactionId()}: ${netAda} lovelace net`);
+          if (thisValue.multiasset()) {
+            for (let [asset, quantity] of thisValue.multiasset()) {
+              assetsToConvert[asset] = (assetsToConvert[asset] ?? 0n) + quantity;
+            }
+          }
+        }
+      }
+      if (settledCount >= identifiers.size) {
+        break;
+      }
+      console.log(`${settledCount}/${identifiers.size} orders settled; checking again in 60s`);
+      await delay(60_000);
+    }
+
+    // All orders have settled. We now know the total ada earned (possibly
+    // negative) and the new assetsToConvert (possibly empty if all swaps were
+    // to ada). If assetsToConvert is empty, stop here and report the total ada
+    // earned across all iterations. Otherwise, issue a new batch of swaps.
+    if (Object.keys(assetsToConvert).length != 0) {
+      mustSwap = true;
+    }
+  }
+  console.log(`Earned ADA (lovelace): ${adaEarned}`);
+  if (argv.convertAssetsOut) {
+    await Bun.write(argv.convertAssetsOut, adaEarned.toString());
   }
 }
 
