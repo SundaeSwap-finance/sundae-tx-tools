@@ -194,7 +194,7 @@ function stablePoolAddress(stakeKeyHash: string): Core.Address {
   });
 }
 
-function makeStablePool(address: Core.Address): [TransactionUnspentOutput, Buffer] {
+function makeStablePool(address: Core.Address, fees: [bigint, bigint, bigint]): [TransactionUnspentOutput, Buffer] {
   let identifier = crypto.randomBytes(28);
   let [policy, name] = [STABLE_TOKEN.slice(0, 56), STABLE_TOKEN.slice(56)];
   let datum = withEncoderHex(encodeStablePoolDatum, {
@@ -208,7 +208,7 @@ function makeStablePool(address: Core.Address): [TransactionUnspentOutput, Buffe
     protocolFeeBasisPoints: [5n, 5n],
     feeManager: null,
     marketOpen: 0n,
-    protocolFees: STABLE_FEES,
+    protocolFees: fees,
     linearAmplification: 200n,
     sumInvariant: 200_000_000n,
     linearAmplificationManager: null,
@@ -216,8 +216,8 @@ function makeStablePool(address: Core.Address): [TransactionUnspentOutput, Buffe
   let nft = Core.AssetId(stableBlueprint.poolSpend.hash + "000de140" + identifier.toString("hex"));
   // 100 ADA and 100 tokens of liquidity, plus the fees
   let output = new TransactionOutput(address, new Core.Value(
-    100_000_000n + STABLE_FEES[0] + STABLE_FEES[1],
-    new Map([[STABLE_TOKEN, 100_000_000n + STABLE_FEES[2]], [nft, 1n]]),
+    100_000_000n + fees[0] + fees[1],
+    new Map([[STABLE_TOKEN, 100_000_000n + fees[2]], [nft, 1n]]),
   ));
   output.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(datum))));
   let input = new TransactionInput(TransactionId(crypto.randomBytes(32).toString("hex")), 0n);
@@ -246,7 +246,7 @@ function withMapExtensions(settings: TransactionUnspentOutput): TransactionUnspe
   return new TransactionUnspentOutput(settings.input(), output);
 }
 
-async function makeWorld(kind: "v3" | "stable" = "v3"): Promise<World> {
+async function makeWorld(kind: "v3" | "stable" = "v3", stableFees = STABLE_FEES): Promise<World> {
   await Core.initCrypto();
   let skey = Core.Ed25519PrivateKey.fromNormalBytes(crypto.randomBytes(32));
   let pkh = await (await skey.toPublic()).hash();
@@ -278,7 +278,7 @@ async function makeWorld(kind: "v3" | "stable" = "v3"): Promise<World> {
     poolBlueprint = blueprint;
   } else {
     for (let i = 0; i < 2; i++) {
-      emulator.addUtxo(makeStablePool(stablePoolAddress(pkh.hex()))[0]);
+      emulator.addUtxo(makeStablePool(stablePoolAddress(pkh.hex()), stableFees)[0]);
     }
     poolAddress = stablePoolAddress(pkh.hex());
     references = [
@@ -498,20 +498,39 @@ describe("autoWithdrawRewards on stable pools", () => {
     world = await makeWorld("stable");
   });
 
-  // Everything but 3 ADA of flat fees is withdrawn, and the treasury takes
-  // 9/10 of each part, so 1/10 of each is withheld
-  const WITHHELD_ADA = (STABLE_FEES[0] - 3_000_000n + STABLE_FEES[1]) / 10n;
-  const WITHHELD_TOKENS = STABLE_FEES[2] / 10n;
+  // Everything but 3 ADA of flat fees is withdrawn. The fixture settings allow
+  // us to withhold 1/10 of each part, rounded down as the pool.manage script
+  // does, and the treasury gets the rest.
+  function withheld(fees: [bigint, bigint, bigint]): { ada: bigint, tokens: bigint } {
+    return {
+      ada: (fees[0] - 3_000_000n) / 10n + fees[1] / 10n,
+      tokens: fees[2] / 10n,
+    };
+  }
 
-  function expectRewards(rewards: TransactionUnspentOutput[]) {
+  function expectRewards(rewards: TransactionUnspentOutput[], fees = STABLE_FEES) {
     expect(rewards.length).toBe(2);
     for (let reward of rewards) {
-      expect(reward.output().amount().multiasset()?.get(STABLE_TOKEN)).toBe(WITHHELD_TOKENS);
+      expect(reward.output().amount().multiasset()?.get(STABLE_TOKEN)).toBe(withheld(fees).tokens);
       // The builder tops this output up to min-ADA from change, so it can hold
       // more ADA than was withheld
-      expect(reward.output().amount().coin()).toBeGreaterThanOrEqual(WITHHELD_ADA);
+      expect(reward.output().amount().coin()).toBeGreaterThanOrEqual(withheld(fees).ada);
     }
   }
+
+  it("pays the treasury its rounded-up share when fees don't divide evenly", async () => {
+    let fees: [bigint, bigint, bigint] = [10_000_007n, 1_000_003n, 5_000_009n];
+    world = await makeWorld("stable", fees);
+    let { rewards } = await runAutoWithdraw(world, 0n, { stable: true });
+
+    expect(world.provider.submissions.length).toBe(2);
+    for (let tx of world.provider.submissions) {
+      let treasury = tx.body().outputs()[1].amount();
+      expect(treasury.coin()).toBe(fees[0] - 3_000_000n + fees[1] - withheld(fees).ada);
+      expect(treasury.multiasset()?.get(STABLE_TOKEN)).toBe(fees[2] - withheld(fees).tokens);
+    }
+    expectRewards(rewards, fees);
+  });
 
   it("withdraws all fees but the flat 3 ADA from every pool", async () => {
     let { rewards } = await runAutoWithdraw(world, 0n, { stable: true });

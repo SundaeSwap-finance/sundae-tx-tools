@@ -2032,14 +2032,15 @@ export async function buildWithdrawStablePoolRewards(options: BuildWithdrawStabl
   let withheldB = 0n;
 
   if (options.allowance) {
-    let n = options.allowance.denominator - options.allowance.numerator;
-    let d = options.allowance.denominator;
-    treasuryAmountFlat = n * withdrawnAmountFlat / d;
-    treasuryAmountA = n * withdrawnAmountA / d;
-    treasuryAmountB = n * withdrawnAmountB / d;
-    withheldFlat = withdrawnAmountFlat - treasuryAmountFlat;
-    withheldA = withdrawnAmountA - treasuryAmountA;
-    withheldB = withdrawnAmountB - treasuryAmountB;
+    // Mirror the pool.manage script: the allowance we withhold is rounded
+    // down, and the treasury must get the rest
+    let { numerator, denominator } = options.allowance;
+    withheldFlat = withdrawnAmountFlat * numerator / denominator;
+    withheldA = withdrawnAmountA * numerator / denominator;
+    withheldB = withdrawnAmountB * numerator / denominator;
+    treasuryAmountFlat = withdrawnAmountFlat - withheldFlat;
+    treasuryAmountA = withdrawnAmountA - withheldA;
+    treasuryAmountB = withdrawnAmountB - withheldB;
   } else if (options.treasuryAmountFlat && options.treasuryAmountA && options.treasuryAmountB) {
     treasuryAmountFlat = options.treasuryAmountFlat;
     treasuryAmountA = options.treasuryAmountA;
