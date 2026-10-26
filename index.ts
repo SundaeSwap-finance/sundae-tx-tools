@@ -553,35 +553,6 @@ async function collectChangeAllowingAssets(provider: Provider, address: Core.Add
   throw new Error(`Couldn't find enough change: want ${amount} but only ${sum} is available from among ${change.length} eligible change utxos`);
 }
 
-// Collect many change utxos to meet a desired total
-async function collectChange(provider: Provider, address: Core.Address, amount: bigint): Promise<Core.TransactionUnspentOutput[]> {
-  let utxos = await provider.getUnspentOutputs(address);
-  let change = [];
-  let sum = 0n;
-  utxos.sort(compareUtxo);
-  for (const utxo of utxos) {
-    // Skip utxos with assets
-    let ma = utxo.output().amount().multiasset();
-    if (ma != undefined && ma.size > 0) {
-      continue;
-    }
-    // Skip utxos with scripts
-    if (utxo.output().scriptRef()) {
-      continue;
-    }
-    // Skip utxos with datums
-    if (utxo.output().datum()) {
-      continue;
-    }
-    change.push(utxo);
-    sum += utxo.output().amount().coin();
-    if (sum >= amount) {
-      return change;
-    }
-  }
-  throw new Error(`Couldn't find enough change: want ${amount} but only ${sum} is available from among ${change.length} eligible change utxos`);
-}
-
 async function fanout(blaze: Blaze<Provider, Wallet>, provider: Provider, wallet: Core.Address, changeUtxos: Core.TransactionUnspentOutput[], count: bigint, submit: boolean, forceSubmit: boolean, txLogDir: string): Core.TransactionUnspentOutput[] {
   const tx = blaze.newTransaction();
 
@@ -635,50 +606,6 @@ async function fanout(blaze: Blaze<Provider, Wallet>, provider: Provider, wallet
     }
     console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
     return getOutputs(completed.body());
-  }
-}
-
-async function paySelf(blaze: Blaze<Provider, Wallet>, provider: Provider, wallet: Core.Address, inputs: Core.TransactionUnspentOutput[], submit: boolean, forceSubmit: boolean, txLogDir: string): Core.TransactionUnspentOutput {
-  const tx = blaze.newTransaction();
-
-  for (const input of inputs) {
-    tx.addInput(input);
-  }
-
-  tx.useCoinSelector((inputs, dearth) => {
-    return {
-      selectedInputs: [],
-      selectedValue: new Value(0n),
-      inputs: [],
-      leftoverInputs: [],
-    }
-  });
-
-  if (forceSubmit) {
-    let completed = await tx.complete();
-    await blaze.signTransaction(completed);
-    await blaze.submitTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    console.log("Submitted");
-    return getOutputs(completed.body())[0];
-  } else if (submit) {
-    let completed = await tx.complete();
-    await blaze.signTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    const response = await prompt("Type 'submit' to submit");
-    if (response == "submit") {
-      await blaze.submitTransaction(completed);
-      console.log("Submitted");
-    }
-    return getOutputs(completed.body())[0];
-  } else {
-    let completed = await tx.complete({ useCoinSelection: false });
-    if (txLogDir) {
-      let txid = completed.getId();
-      fs.writeFileSync(`${txLogDir}/${txid}-pay-self.tx`, tx.toCbor());
-    }
-    console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
-    return getOutputs(completed.body())[0];
   }
 }
 
@@ -2722,195 +2649,6 @@ export async function setupBlaze(args: any): Promise<{ blaze: Blaze<Provider, Wa
   };
 }
 
-interface PayoutOptions {
-  blaze: Blaze<Provider, Wallet>,
-  provider: Provider,
-  walletAddress: Address,
-  poolAddress: string,
-  reportFile: string,
-  addressesFile: string,
-  references: string,
-  blueprint: Blueprint,
-  withheldAddress: Address,
-  submit: boolean | undefined,
-  forceSubmit: boolean | undefined,
-  protocolFeesSigners: string,
-  tokenHoldersDestination: Address,
-  txLogDir: string,
-  genericStakeAddress: Address,
-  sundaePoolStakeAddress: Address,
-  genericStakeKeyFile: string,
-  treasuryAddress: Address,
-  sundaeStakingSigner: string,
-}
-
-function makePayoutOptions(argv: any, config: any, blaze: Blaze<Provider, Wallet>, provider: Provider, bp: Blueprint): PayoutOptions {
-  return {
-    addressesFile: config.addressesFile as string,
-    reportFile: argv.reportFile as string,
-    poolAddress: config.poolAddress as string,
-    blaze: blaze,
-    provider: provider,
-    walletAddress: Core.addressFromBech32(config.walletAddress as string),
-    references: config.referencesFile as string,
-    blueprint: bp,
-    withheldAddress: Core.addressFromBech32(config.withheldAddress as string),
-    submit: argv.submit,
-    forceSubmit: argv.forceSubmit,
-    protocolFeesSigners: config.protocolFeesSigners as string,
-    tokenHoldersDestination: Core.addressFromBech32(config.tokenHoldersDestination as string),
-    txLogDir: config.txLogDir,
-    genericStakeAddress: Core.addressFromBech32(config.genericStakeAddress as string),
-    sundaePoolStakeAddress: Core.addressFromBech32(config.sundaePoolStakeAddress as string),
-    genericStakeKeyFile: config.genericStakeKeyFile as string,
-    treasuryAddress: Core.addressFromBech32(config.treasuryAddress as string),
-    sundaeStakingSigner: config.sundaeStakingSigner as string,
-  };
-}
-
-export async function payouts(argv: any) {
-  let config = JSON.parse(fs.readFileSync(argv.payoutConfig, "utf8"));
-  let bp = decodeBlueprint(fs.readFileSync(config.blueprint as string, "utf8"));
-  let { blaze, provider } = await setupBlaze({
-    mainnet: argv.mainnet,
-    skeyFile: argv.skeyFile,
-    walletAddress: config.walletAddress,
-  });
-  let payoutOptions = makePayoutOptions(argv, config, blaze, provider, bp);
-  await doPayouts(payoutOptions);
-}
-
-async function doPayouts(options: PayoutOptions) {
-  await mkdir(options.txLogDir, { recursive: true });
-
-  let addressesJson = fs.readFileSync(options.addressesFile, "utf8");
-  let addresses = decodeAddressesFromJson(addressesJson);
-  let reportJson = fs.readFileSync(options.reportFile, "utf8");
-  let report = decodeReportFromJson(reportJson);
-  let payments = computePayments(report, addresses);
-
-  console.log("withdraw protocol fees");
-
-  let stakeWithdrawalsCount = 2;
-
-  let protocolFeesTodo = await queryPools(options.provider, options.poolAddress, report.payments.protocolFeesNeeded);
-
-  let changeNeededCount = BigInt(protocolFeesTodo.length + stakeWithdrawalsCount + 1);
-  let totalChangeAmountNeeded = 10_000_000n * changeNeededCount + 3_000_000n;
-  let initialChange = await collectChange(options.provider, options.walletAddress, totalChangeAmountNeeded);
-
-  let allChange = await fanout(
-    options.blaze,
-    options.provider,
-    options.walletAddress,
-    initialChange,
-    changeNeededCount,
-    options.submit,
-    options.forceSubmit,
-    options.txLogDir,
-  );
-
-  let genericChange = allChange[0];
-  let poolStakeChange = allChange[1];
-  let extraChange = allChange[2];
-  let protocolFeesChange = allChange.slice(3);
-
-  let autoWithdrawOptions: AutoWithdrawOptions = {
-    poolAddress: options.poolAddress,
-    needed: report.payments.protocolFeesNeeded,
-    walletAddress: options.walletAddress,
-    blueprint: options.blueprint,
-    blaze: options.blaze,
-    provider: options.provider,
-    references: readReferences(options.references),
-    retry: await cliRetryOptions(options.submit, options.forceSubmit),
-    withheldAddress: options.withheldAddress,
-    signers: options.protocolFeesSigners,
-    txLogDir: options.txLogDir,
-    stable: false,
-    stableBlueprint: undefined,
-    todo: { pools: protocolFeesTodo, change: protocolFeesChange },
-  };
-
-  let { change: protocolFeesChangeUtxos } = await autoWithdrawRewards(autoWithdrawOptions);
-
-  console.log(`withdraw generic staking rewards for ${options.genericStakeAddress.toBech32()}`);
-  
-  let withdrawableGeneric = await queryRewards(
-    options.provider.network == NetworkId.Mainnet,
-    options.genericStakeAddress.toBech32(),
-  );
-  if (!withdrawableGeneric) {
-    console.log("couldn't query rewards for generic stake addr");
-    process.exit(1);
-  }
-  let withdrawGenericOptions: BuildWithdrawGenericStake = {
-    blaze: options.blaze,
-    change: genericChange,
-    stakeAddress: options.genericStakeAddress,
-    withdrawnAmount: withdrawableGeneric,
-    submit: options.submit || false,
-    forceSubmit: options.forceSubmit || false,
-    stakeKeyFile: options.genericStakeKeyFile,
-    txLogDir: options.txLogDir,
-  };
-  let genericOutput = await buildWithdrawGenericStake(withdrawGenericOptions);
-
-  console.log(`withdraw sundae pool staking rewards for ${options.sundaePoolStakeAddress.toBech32()}`);
-
-  let withdrawableStaking = await queryRewards(
-    options.provider.network == NetworkId.Mainnet,
-    options.sundaePoolStakeAddress.toBech32(),
-  );
-  if (!withdrawableStaking) {
-    console.log("couldn't query rewards for sundae pool stake addr");
-    process.exit(1);
-  }
-  let withdrawSundaeStakeOptions: BuildWithdrawPoolStakeRewards = {
-    blaze: options.blaze,
-    provider: options.provider,
-    change: poolStakeChange,
-    stakeAddress: options.sundaePoolStakeAddress,
-    withdrawnAmount: withdrawableStaking,
-    submit: options.submit || false,
-    forceSubmit: options.forceSubmit || false,
-    blueprint: options.blueprint,
-    signers: options.sundaeStakingSigner,
-    withheldAddress: options.walletAddress,
-    treasuryAddress: options.treasuryAddress, // TODO: Derive from settings datum
-    txLogDir: options.txLogDir,
-  };
-  let poolStakeOutput = await buildWithdrawPoolStakeRewards(withdrawSundaeStakeOptions);
-
-  console.log("collecting change for payout tx");
-
-  let output = await paySelf(
-    options.blaze,
-    options.provider,
-    options.walletAddress,
-    [...protocolFeesChangeUtxos, genericOutput, poolStakeOutput, extraChange],
-    options.submit,
-    options.forceSubmit,
-    options.txLogDir,
-  );
-
-  let buildPayoutOptions: BuildPayoutOptions = {
-    changeUtxos: [output],
-    blaze: options.blaze,
-    report: report,
-    tokenHoldersDestination: options.tokenHoldersDestination,
-    scooperPayments: payments,
-    submit: options.submit,
-    forceSubmit: options.forceSubmit,
-    addresses: addresses,
-    txLogDir: options.txLogDir,
-  }
-
-  console.log("building payout tx");
-
-  await payout(buildPayoutOptions);
-}
-
 interface AutoWithdrawOptions {
   poolAddress: string,
   needed: bigint,
@@ -2981,12 +2719,24 @@ export async function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, 
   }
 }
 
-interface Report {
+export interface Report {
   feesPaid: FeesPaid,
   totalScoopers: bigint,
   payments: ExtraPayments,
   delegatedScoopers: string[],
+  // Payment fields the report has that we don't know how to pay
+  unrecognizedPayments: string[],
 }
+
+const RECOGNIZED_PAYMENTS = [
+  "tokenHoldersFee",
+  "yieldFarming",
+  "flat",
+  "totalPayout",
+  "protocolFeesNeeded",
+  "totalScooperPayout",
+  "stakingRewardsNeeded",
+];
 
 type FeesPaid = Map<string, bigint>;
 
@@ -3000,7 +2750,7 @@ interface ExtraPayments {
 
 type Addresses = Map<string, Address>;
 
-function decodeAddressesFromJson(json: string): Addresses {
+export function decodeAddressesFromJson(json: string): Addresses {
   let obj = JSON.parse(json);
   let addresses = new Map();
   for (const [name, addrs] of Object.entries(obj.scoopers)) {
@@ -3010,7 +2760,7 @@ function decodeAddressesFromJson(json: string): Addresses {
   return addresses;
 }
 
-function decodeReportFromJson(json: string): Report {
+export function decodeReportFromJson(json: string): Report {
   let obj = JSON.parse(json);
   let report: Report = {
     feesPaid: new Map(),
@@ -3023,9 +2773,10 @@ function decodeReportFromJson(json: string): Report {
       protocolFeesNeeded: 0n,
     },
     delegatedScoopers: [],
+    unrecognizedPayments: [],
   };
 
-  report.delegatedScoopers = obj.delegatedScoopers;
+  report.delegatedScoopers = obj.delegatedScoopers ?? [];
 
   for (const [scooperName, feesPaid] of Object.entries(obj.feesPaid)) {
     report.feesPaid.set(scooperName, BigInt(feesPaid as number));
@@ -3038,31 +2789,58 @@ function decodeReportFromJson(json: string): Report {
   if (!obj.payments) {
     throw new Error("Missing 'payments'");
   }
-  if (typeof obj.payments.yieldFarming== undefined) {
+  if (obj.payments.yieldFarming === undefined) {
     throw new Error("Missing 'payments.yieldFarming'");
   }
   report.payments.yieldFarming = BigInt(obj.payments.yieldFarming);
-  if (typeof obj.payments.tokenHoldersFee == undefined) {
+  if (obj.payments.tokenHoldersFee === undefined) {
     throw new Error("Missing 'payments.tokenHoldersFee'");
   }
   report.payments.tokenHoldersFee = BigInt(obj.payments.tokenHoldersFee);
 
-  if (typeof obj.payments.flat == undefined) {
+  if (obj.payments.flat === undefined) {
     throw new Error("Missing 'payments.flat'");
   }
   report.payments.flat = BigInt(obj.payments.flat);
 
-  if (typeof obj.payments.totalPayout == undefined) {
+  if (obj.payments.totalPayout === undefined) {
     throw new Error("Missing 'payments.totalPayout'");
   }
   report.payments.totalPayout = BigInt(obj.payments.totalPayout);
 
-  if (typeof obj.payments.protocolFeesNeeded == undefined) {
+  if (obj.payments.protocolFeesNeeded === undefined) {
     throw new Error("Missing 'payments.protocolFeesNeeded'");
   }
   report.payments.protocolFeesNeeded = BigInt(obj.payments.protocolFeesNeeded);
 
+  report.unrecognizedPayments = Object.keys(obj.payments).filter((k) => !RECOGNIZED_PAYMENTS.includes(k));
+
   return report;
+}
+
+// Checks that the payout pays out the whole report under the current
+// allocation: 35% of revenue to yield farming and 10% to token holders, with
+// the scoopers' share and the rest computed by the report. Yield farming is paid
+// in SUNDAE bought with its share, but counts toward the total here.
+export function checkPayoutTotals(report: Report, payments: Payment[]) {
+  if (report.unrecognizedPayments.length > 0) {
+    throw new Error(`Report has payments the payout doesn't make: ${report.unrecognizedPayments.join(", ")}`);
+  }
+  let { yieldFarming, tokenHoldersFee, totalPayout } = report.payments;
+  // Each share is rounded to the lovelace, so allow for that
+  let skew = yieldFarming * 10n - tokenHoldersFee * 35n;
+  if (skew < -45n || skew > 45n) {
+    throw new Error(`Yield farming (${yieldFarming}) and token holders (${tokenHoldersFee}) aren't split 35:10`);
+  }
+  let paid = yieldFarming + tokenHoldersFee;
+  for (let payment of payments) {
+    paid += payment.lovelace;
+  }
+  // Again allowing for each scooper's payment to be rounded
+  let difference = paid - totalPayout;
+  if (difference < -BigInt(payments.length) || difference > BigInt(payments.length)) {
+    throw new Error(`Payments add up to ${paid}, but the report's total payout is ${totalPayout}`);
+  }
 }
 
 interface Payment {
@@ -3072,7 +2850,7 @@ interface Payment {
 
 // Given a revenue report, compute a list of payments to scoopers, and a list of
 // additional payments according to the scooper payment agreement
-function computePayments(report: Report, addresses: Addresses): Payment[] {
+export function computePayments(report: Report, addresses: Addresses): Payment[] {
   let payments = [];
   for (const [scooperName, feesPaid] of report.feesPaid) {
     let resolvedAddress = addresses.get(scooperName);
@@ -3090,7 +2868,7 @@ function computePayments(report: Report, addresses: Addresses): Payment[] {
   return payments;
 }
 
-function displayPreviousMonth(date: Date) {
+export function displayPreviousMonth(date: Date) {
   let month = date.getMonth();
   let year = date.getFullYear();
   if (month == 0) {
@@ -3100,7 +2878,7 @@ function displayPreviousMonth(date: Date) {
   return `${year}-${month.toString().padStart(2, '0')}`;
 }
 
-interface BuildPayoutOptions {
+export interface BuildPayoutOptions {
   changeUtxos: Core.TransactionUnspentOutput[],
   blaze: Blaze<Provider, Wallet>,
   report: Report,
@@ -3108,11 +2886,16 @@ interface BuildPayoutOptions {
   yieldFarmingDestination: Address,
   yieldFarmingAmount: bigint,
   scooperPayments: Payment[],
-  submit: boolean | undefined,
-  forceSubmit: boolean | undefined,
+  // Undefined means a dry run: build the payout without submitting it
+  approve: ((tx: Transaction) => Promise<boolean>) | undefined,
   addresses: Addresses,
   txLogDir: string,
+  sundaeAssetId: string,
+  // The month being paid out, as YYYY-MM, for the transaction metadata
+  month: string,
 }
+
+const MAINNET_SUNDAE = "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d7753554e444145";
 
 export async function doPayout(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
@@ -3124,13 +2907,18 @@ export async function doPayout(argv: any) {
   let reportJson = fs.readFileSync(argv.reportFile, "utf8");
   let report = decodeReportFromJson(reportJson);
   let payments = computePayments(report, addresses);
+  checkPayoutTotals(report, payments);
+
+  // Payouts are normally run early in the month for the previous month
+  let month = argv.month ?? displayPreviousMonth(new Date());
+  if (!/^\d{4}-\d{2}$/.test(month)) {
+    throw new Error(`Expected --month as YYYY-MM, got ${month}`);
+  }
+  console.log(`Paying out revenue for ${month}`);
 
   let need = new Multiasset();
   need.addAsset("", report.payments.totalPayout + 20_000_000n);
-  need.addAsset(
-    "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d7753554e444145",
-    BigInt(argv.yieldFarmingAmount),
-  );
+  need.addAsset(MAINNET_SUNDAE, BigInt(argv.yieldFarmingAmount));
   let utxos = await collectChangeMa(provider, address, need);
 
   let options: BuildPayoutOptions = {
@@ -3140,11 +2928,12 @@ export async function doPayout(argv: any) {
     yieldFarmingDestination: Core.addressFromBech32(argv.yieldFarmingDestination),
     yieldFarmingAmount: BigInt(argv.yieldFarmingAmount),
     tokenHoldersDestination: Core.addressFromBech32(argv.tokenHoldersDestination),
-    submit: argv.submit,
-    forceSubmit: argv.forceSubmit,
+    approve: argv.submit || argv.forceSubmit ? await cliApprover(!!argv.forceSubmit) : undefined,
     scooperPayments: payments,
     addresses: addresses,
     txLogDir: argv.txLogDir,
+    sundaeAssetId: MAINNET_SUNDAE,
+    month,
   };
   await payout(options);
 }
@@ -3385,7 +3174,7 @@ async function buildWithdrawPoolStakeRewards(options: BuildWithdrawPoolStakeRewa
   }
 }
 
-async function payout(options: BuildPayoutOptions) {
+export async function payout(options: BuildPayoutOptions): Promise<Transaction> {
   const tx = options.blaze.newTransaction();
 
   for (const change of options.changeUtxos) {
@@ -3401,22 +3190,17 @@ async function payout(options: BuildPayoutOptions) {
   );
   let yieldFarmingSundaeValue = new Multiasset();
   yieldFarmingSundaeValue.addAsset("", 2_000_000);
-  yieldFarmingSundaeValue.addAsset(
-    "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d77.53554e444145",
-    options.yieldFarmingAmount,
-  );
+  yieldFarmingSundaeValue.addAsset(options.sundaeAssetId, options.yieldFarmingAmount);
   tx.payAssets(
     options.yieldFarmingDestination,
     yieldFarmingSundaeValue.toCoreValue(),
   );
 
-  let timestamp = displayPreviousMonth(new Date());
-
   let mm = new Map([
     [
       "msg", 
       [
-        `Sundae Revenue ${timestamp}`
+        `Sundae Revenue ${options.month}`
       ]
     ]
   ]);
@@ -3462,30 +3246,37 @@ async function payout(options: BuildPayoutOptions) {
     }
   });
 
-  if (options.forceSubmit) {
-    let completed = await tx.complete();
-    await options.blaze.signTransaction(completed);
-    await options.blaze.submitTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    console.log("Submitted");
-  } else if (options.submit) {
-    let completed = await tx.complete();
-    await options.blaze.signTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    const response = await prompt("Type 'submit' to submit");
-    if (response == "submit") {
-      await options.blaze.submitTransaction(completed);
-      console.log("Submitted");
+  let completed = await tx.complete({ useCoinSelection: false });
+
+  // Blaze raises outputs below min-ADA out of change, which would quietly
+  // overpay. Payments are added first, in order, so check them by index.
+  let expected = [
+    ...options.scooperPayments.map((p) => p.lovelace),
+    options.report.payments.tokenHoldersFee,
+  ];
+  let outputs = completed.body().outputs();
+  for (let i = 0; i < expected.length; i++) {
+    if (outputs[i].amount().coin() != expected[i]) {
+      throw new Error(`Payout output ${i} would pay ${outputs[i].amount().coin()} instead of ${expected[i]}`);
     }
-  } else {
-    console.log(`payout pre-complete: ${tx.toCbor()}`);
-    let completed = await tx.complete({ useCoinSelection: false });
+  }
+
+  if (!options.approve) {
     if (options.txLogDir) {
       let txid = completed.getId();
-      fs.writeFileSync(`${options.txLogDir}/${txid}-payout.tx`, tx.toCbor());
+      fs.writeFileSync(`${options.txLogDir}/${txid}-payout.tx`, completed.toCbor());
     }
     console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
+    return completed;
   }
+
+  await options.blaze.signTransaction(completed);
+  if (!(await options.approve(completed))) {
+    throw new Error("Aborted by operator");
+  }
+  await options.blaze.submitTransaction(completed);
+  console.log("Submitted");
+  return completed;
 }
 
 function isChange(utxo: Core.TransactionUnspentOutput): boolean {
@@ -4459,8 +4250,6 @@ if (import.meta.main) {
     await Bun.write(argv.rewardsOut, totalWithdrawn.toJSON());
   } else if (argv.testAutoWithdraw) {
     await testAutoWithdraw(argv);
-  } else if (argv.doPayouts) {
-    await payouts(argv);
   } else if (argv.doPayout) {
     await doPayout(argv);
   } else if (argv.makeChangeUtxos) {
