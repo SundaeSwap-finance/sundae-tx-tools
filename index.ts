@@ -2533,16 +2533,24 @@ async function findConfirmed(provider: Provider, attempts: { tx: Transaction, id
   return undefined;
 }
 
+function spendsInput(tx: Transaction, input: TransactionInput): boolean {
+  return tx.body().inputs().values().some((i) =>
+    i.transactionId() == input.transactionId() && i.index() == input.index()
+  );
+}
+
 // Builds, submits and waits for a transaction, rebuilding and resubmitting
 // until one attempt is confirmed on chain. This takes a *builder* so that each
 // attempt picks up the current state of any contended input, e.g. a pool that a
 // scooper spent just before we submitted.
 //
-// Every attempt must spend a common input (for withdrawals, the change utxo),
-// so that at most one attempt can ever land. That makes it safe to give up
-// waiting on an attempt and retry: if the earlier attempt lands late, the retry
-// can't also land, and we find the earlier one before the next rebuild.
-async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, options: RetryOptions, buildTx: () => Promise<Transaction>): Promise<Transaction> {
+// Every attempt must spend the same `anchor` input (for withdrawals, the change
+// utxo), so that at most one attempt can ever land. That makes it safe to give
+// up waiting on an attempt and retry: if the earlier attempt lands late, the
+// retry can't also land, and we find the earlier one before the next rebuild.
+// A built transaction that doesn't spend the anchor is a bug in the builder, so
+// it fails immediately instead of being retried.
+export async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, options: RetryOptions, anchor: TransactionInput, buildTx: () => Promise<Transaction>): Promise<Transaction> {
   let attempts: { tx: Transaction, id: string }[] = [];
   let lastError: unknown = undefined;
   for (let attempt = 1; attempt <= options.maxAttempts; attempt++) {
@@ -2558,12 +2566,15 @@ async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, options: 
     let tx;
     try {
       tx = await buildTx();
-      await blaze.signTransaction(tx);
     } catch (error) {
       console.log(`Attempt ${attempt}: couldn't build transaction: ${error}`);
       lastError = error;
       continue;
     }
+    if (!spendsInput(tx, anchor)) {
+      throw new Error(`Retried transaction ${tx.getId()} doesn't spend the anchor input ${anchor.transactionId()}#${anchor.index()}`);
+    }
+    await blaze.signTransaction(tx);
 
     if (!(await options.approve(tx))) {
       throw new Error("Aborted by operator");
@@ -3717,7 +3728,7 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Promise
     let tx;
     if (options.retry) {
       // Every attempt for this pool spends thisChange, so at most one can land
-      tx = await submitAndAwaitWithRetry(options.blaze, options.retry, buildTx);
+      tx = await submitAndAwaitWithRetry(options.blaze, options.retry, thisChange.input(), buildTx);
     } else {
       tx = await buildTx();
       console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
