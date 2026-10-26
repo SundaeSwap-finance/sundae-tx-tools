@@ -300,7 +300,10 @@ class Multiasset {
   }
 
   public addAsset(aRaw: string, amount: bigint) {
-    let a = this.normalizeAsset(aRaw);
+    let a = "";
+    if (aRaw != "" && aRaw != "ada.lovelace") {
+      a = this.normalizeAsset(aRaw);
+    }
     let q = this.ma.get(a);
     if (q) {
       this.ma.set(a, q + amount);
@@ -1181,6 +1184,106 @@ export async function updateSinglePoolStakeCredential(argv: any) {
   }
   let change = await findChange(provider, address, 20_000_000n);
   let completed = await updatePoolStakeCredential(argv, pool, change);
+  if (argv.submit) {
+    let signed = await blaze.signTransaction(completed);
+    console.log(`Signed...`);
+    let hash = await blaze.submitTransaction(completed);
+    console.log(`Submitted (${hash})...`);
+    let confirmed = await provider.awaitTransactionConfirmation(hash, 60_000);
+    if (confirmed) {
+      console.log("Confirmed");
+    } else {
+      console.log("Couldn't confirm submission");
+    }
+  } else {
+    console.log(`Please sign and submit this transaction: ${completed.toCbor()}`);
+  }
+}
+
+// Spend the settings utxo with the SettingsAdminUpdate redeemer and pay it back
+// to the settings address with an updated datum. Currently this sets the
+// extensions field to an empty map (Pairs<Int, Data>). Ported from addScooper in
+// lucid-preview-sundae-aiken.
+export async function updateSettingsDatum(argv: any) {
+  let { blaze, provider } = await setupBlaze(argv);
+  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
+  let address = Core.addressFromBech32(argv.address);
+
+  const settingsAddress = new Core.Address({
+    type: Core.AddressType.EnterpriseScript,
+    networkId: provider.network,
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: Hash28ByteBase16(bp.settingsSpend.hash),
+    },
+  });
+  const settings = await findSettings(provider, settingsAddress, bp.settingsSpend.hash);
+
+  let settingsDatumCbor = settings.output().datum()?.asInlineData()?.toCbor();
+  if (!settingsDatumCbor) {
+    throw new Error("Couldn't get settings datum");
+  }
+  let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
+  // Empty CBOR map; extensions is Pairs<Int, Data> on-chain
+  settingsDatum.extensions = Buffer.from([0xa0]);
+
+  let newSettingsDatumCbor = withEncoderHex(encodeSettingsDatum, settingsDatum);
+  console.log(`old settings datum: ${settingsDatumCbor}`);
+  console.log(`new settings datum: ${newSettingsDatumCbor}`);
+
+  let newSettingsDatum = PlutusData.fromCbor(HexBlob(newSettingsDatumCbor));
+
+  // SettingsAdminUpdate
+  let settingsRedeemer = PlutusData.fromCbor(HexBlob("d87a9fd8799fffff"));
+
+  let settingsScript = Script.newPlutusV2Script(
+    new PlutusV2Script(HexBlob(bp.settingsSpend.validator))
+  );
+
+  // The settings admin must sign. --settingsAdminPkhHex is a comma-separated
+  // list (e.g. enough keys to satisfy an AtLeast multisig). Defaults to the
+  // payment key of --address.
+  let signerPkhs: string[] = argv.settingsAdminPkhHex
+    ? String(argv.settingsAdminPkhHex).split(",")
+    : [address.getProps().paymentPart?.hash].filter((h): h is string => !!h);
+  if (signerPkhs.length == 0) {
+    throw new Error("Couldn't determine settings admin pkh");
+  }
+
+  let change = await findChange(provider, address, 20_000_000n);
+
+  let tx = blaze
+    .newTransaction()
+
+    // Spend the settings utxo.
+    .addInput(settings, settingsRedeemer)
+
+    // Spend pre-selected change.
+    .addInput(change)
+
+    // Pay the settings utxo back with the same value and the updated datum.
+    .lockAssets(settings.output().address(), settings.output().amount(), newSettingsDatum as unknown as Datum)
+
+    .useCoinSelector((inputs, dearth) => {
+      return {
+        selectedInputs: [],
+        selectedValue: new Value(0n),
+        inputs: [],
+        leftoverInputs: [],
+      }
+    })
+
+    .provideScript(settingsScript);
+
+  for (let s of signerPkhs) {
+    tx.addRequiredSigner(Core.Ed25519KeyHashHex(s));
+  }
+
+  tx.provideCollateral([change]);
+
+  console.log(`Will complete tx: ${tx.toCbor()}`);
+
+  let completed = await tx.complete();
   if (argv.submit) {
     let signed = await blaze.signTransaction(completed);
     console.log(`Signed...`);
@@ -2532,7 +2635,6 @@ interface PayoutOptions {
   forceSubmit: boolean | undefined,
   protocolFeesSigners: string,
   tokenHoldersDestination: Address,
-  otherPaymentsDestination: Address,
   txLogDir: string,
   genericStakeAddress: Address,
   sundaePoolStakeAddress: Address,
@@ -2556,7 +2658,6 @@ function makePayoutOptions(argv: any, config: any, blaze: Blaze<Provider, Wallet
     forceSubmit: argv.forceSubmit,
     protocolFeesSigners: config.protocolFeesSigners as string,
     tokenHoldersDestination: Core.addressFromBech32(config.tokenHoldersDestination as string),
-    otherPaymentsDestination: Core.addressFromBech32(config.otherPaymentsDestination as string),
     txLogDir: config.txLogDir,
     genericStakeAddress: Core.addressFromBech32(config.genericStakeAddress as string),
     sundaePoolStakeAddress: Core.addressFromBech32(config.sundaePoolStakeAddress as string),
@@ -2696,7 +2797,6 @@ async function doPayouts(options: PayoutOptions) {
     blaze: options.blaze,
     report: report,
     tokenHoldersDestination: options.tokenHoldersDestination,
-    otherPaymentsDestination: options.otherPaymentsDestination,
     scooperPayments: payments,
     submit: options.submit,
     forceSubmit: options.forceSubmit,
@@ -2882,7 +2982,8 @@ interface BuildPayoutOptions {
   blaze: Blaze<Provider, Wallet>,
   report: Report,
   tokenHoldersDestination: Address,
-  otherPaymentsDestination: Address,
+  yieldFarmingDestination: Address,
+  yieldFarmingAmount: bigint,
   scooperPayments: Payment[],
   submit: boolean | undefined,
   forceSubmit: boolean | undefined,
@@ -2905,7 +3006,7 @@ export async function doPayout(argv: any) {
   need.addAsset("", report.payments.totalPayout + 20_000_000n);
   need.addAsset(
     "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d7753554e444145",
-    report.payments.yieldFarming
+    BigInt(argv.yieldFarmingAmount),
   );
   let utxos = await collectChangeMa(provider, address, need);
 
@@ -2914,6 +3015,7 @@ export async function doPayout(argv: any) {
     changeUtxos: utxos,
     report: report,
     yieldFarmingDestination: Core.addressFromBech32(argv.yieldFarmingDestination),
+    yieldFarmingAmount: BigInt(argv.yieldFarmingAmount),
     tokenHoldersDestination: Core.addressFromBech32(argv.tokenHoldersDestination),
     submit: argv.submit,
     forceSubmit: argv.forceSubmit,
@@ -3178,7 +3280,7 @@ async function payout(options: BuildPayoutOptions) {
   yieldFarmingSundaeValue.addAsset("", 2_000_000);
   yieldFarmingSundaeValue.addAsset(
     "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d77.53554e444145",
-    options.report.payments.yieldFarming
+    options.yieldFarmingAmount,
   );
   tx.payAssets(
     options.yieldFarmingDestination,
@@ -4268,7 +4370,12 @@ async function doSwap(argv: any) {
 
   let changes = await collectChangeMa(provider, wallet, toPay);
 
-  let queryProvider = new QueryProviderSundaeSwap("mainnet");
+  let queryProvider;
+  if (argv.mainnet) {
+    queryProvider = new QueryProviderSundaeSwap("mainnet");
+  } else {
+    queryProvider = new QueryProviderSundaeSwap("preview");
+  }
   let pools = await queryProvider.findPoolDataByAssetPair(
     argv.assetA,
     argv.assetB,
@@ -4292,6 +4399,7 @@ async function doSwap(argv: any) {
     }
   }
 
+  let identifier = new Uint8Array(randomTxId());
   let tx = await buildSwap({
     blaze: blaze,
     pool: bestPool,
@@ -4300,8 +4408,10 @@ async function doSwap(argv: any) {
     swapOfferAmount: BigInt(argv.swapOfferAmount),
     offeredAsset: argv.assetA,
     orderScriptAddress: Core.addressFromBech32(argv.orderScriptAddress),
+    identifier,
   });
   
+  let submittedTx = null;
   if (argv.forceSubmit) {
     let completed = await tx.complete();
     await blaze.signTransaction(completed);
@@ -4316,12 +4426,55 @@ async function doSwap(argv: any) {
     if (response == "submit") {
       await blaze.submitTransaction(completed);
       console.log("Submitted");
+      submittedTx = completed;
     }
   } else {
     console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
     let completed = await tx.complete();
     console.log(`(Completed tx: ${completed.toCbor()})`);
   }
+
+  if (!submittedTx) {
+    return;
+  }
+
+  let confirmed = await provider.awaitTransactionConfirmation(submittedTx.getId(), 300_000);
+  if (!confirmed) {
+    throw new Error("list-order transaction did not settle");
+  }
+  console.log("list-order transaction confirmed; waiting for scoop");
+
+  let assetsEarned = new Multiasset();
+  let done = false;
+  while (!done) {
+    let unspentOutputs = await provider.getUnspentOutputs(wallet);
+    for (let utxo of unspentOutputs) {
+      let thisDatum = utxo.output().datum()?.asInlineData()?.asBoundedBytes()?.toHex();
+      if (!thisDatum) {
+        continue;
+      }
+
+      if (identifier.toHex() == thisDatum) {
+        let thisValue = utxo.output().amount();
+        let riderAndFee = 4_500_000n;
+        let netAda = thisValue.coin() - riderAndFee;
+        assetsEarned.addAsset("", netAda);
+        console.log(`Order ${thisDatum} settled in tx ${utxo.input().transactionId()}: ${netAda} lovelace net`);
+        if (thisValue.multiasset()) {
+          for (let [asset, quantity] of thisValue.multiasset()) {
+            assetsEarned.addAsset(asset, quantity);
+          }
+        }
+        done = true;
+      }
+    }
+    if (!done) {
+      console.log(`order not yet settled; checking again in 60s`);
+      await delay(60_000);
+    }
+  }
+  console.log(`Assets earned: ${assetsEarned.toJSON()}`);
+  await Bun.write(argv.rewardsOut, assetsEarned.toJSON());
 }
 
 // Given a file describing amounts of various assets in a wallet, swap each of
@@ -4358,6 +4511,8 @@ if (import.meta.main) {
     await updateAllPoolStakeCredentials(argv);
   } else if (argv.updateSinglePoolStakeCredential) {
     await updateSinglePoolStakeCredential(argv);
+  } else if (argv.updateSettingsDatum) {
+    await updateSettingsDatum(argv);
   } else if (argv.registerStakeAddress) {
     await registerStakeAddress(argv);
   } else if (argv.debugConditionedScoop) {

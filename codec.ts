@@ -1062,6 +1062,8 @@ export interface SettingsDatum {
   simpleFee: bigint,
   strategyFee: bigint,
   poolCreationFee: bigint,
+  // Raw CBOR of the extensions field. When absent, encodes as Void (d87980).
+  extensions?: Buffer,
 }
 
 export function encodeSettingsDatum(e: Encoder, settingsDatum: SettingsDatum) {
@@ -1078,8 +1080,12 @@ export function encodeSettingsDatum(e: Encoder, settingsDatum: SettingsDatum) {
   encodeInteger(e, settingsDatum.simpleFee);
   encodeInteger(e, settingsDatum.strategyFee);
   encodeInteger(e, settingsDatum.poolCreationFee);
-  encodeTag8(e, 121n);
-  encodeEmptyArray(e);
+  if (settingsDatum.extensions) {
+    e.writeBytes(settingsDatum.extensions);
+  } else {
+    encodeTag8(e, 121n);
+    encodeEmptyArray(e);
+  }
   encodeBreak(e);
 }
 
