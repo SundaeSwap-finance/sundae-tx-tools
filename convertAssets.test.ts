@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import * as crypto from "node:crypto";
 import { Core } from "@blaze-cardano/sdk";
 import { EContractVersion } from "@sundaeswap/core";
-import { convertAssetsToAda, type ConvertAssetsOptions } from "./index.ts";
+import { buyWithAda, convertAssetsToAda, type BuyWithAdaOptions, type ConvertAssetsOptions } from "./index.ts";
 import {
   FakeQueryProvider,
   FakeScooper,
@@ -189,5 +189,61 @@ describe("withdrawing stable pool fees and converting them to ada", () => {
     // treasury's share of the withdrawn tokens is left. Those outputs carry the
     // treasury's Void datum, which keeps them out of the conversion.
     expect(walletBalance(world, STABLE_TOKEN)).toBe(2n * (STABLE_FEES[2] - STABLE_FEES[2] / 10n));
+  });
+});
+
+describe("buyWithAda", () => {
+  let world: World;
+  let market: Market;
+
+  beforeEach(async () => {
+    world = await makeWorld("v3");
+    market = makeMarket(world);
+  });
+
+  function runBuy(asset: string, amount: bigint, overrides: Partial<BuyWithAdaOptions> = {}) {
+    return buyWithAda({
+      blaze: world.blaze,
+      provider: world.provider,
+      queryProvider: market.query,
+      walletAddress: world.wallet,
+      preferredPools: market.preferredPools,
+      asset,
+      amount,
+      approve: async () => true,
+      confirmationTimeoutMs: 0,
+      pollIntervalMs: 0,
+      maxPolls: 10,
+      sleep: async () => market.scooper.scoop(),
+      ...overrides,
+    });
+  }
+
+  it("buys the asset and reports what it received", async () => {
+    let received = await runBuy(STABLE_TOKEN, 30_000_000n);
+
+    let tokens = swapOutput(2_000_000_000n, 1_000_000_000n, 30_000_000n);
+    expect(market.scooper.filled.map((f) => f.offered)).toEqual([["ada.lovelace", 30_000_000n]]);
+    expect(walletBalance(world, STABLE_TOKEN)).toBe(tokens);
+    // As written to the yield farming file and read by the payout step
+    expect(JSON.parse(received.toJSON())).toEqual({
+      "": (-market.scooper.protocolFee).toString(),
+      [STABLE_TOKEN]: tokens.toString(),
+    });
+  });
+
+  it("refuses a preferred pool that doesn't trade the asset for ada", async () => {
+    await expect(runBuy(OTHER_TOKEN, 30_000_000n)).rejects.toThrow(/not ada for/);
+    expect(world.provider.submissions.length).toBe(0);
+  });
+
+  it("gives up when the order doesn't settle", async () => {
+    market.scooper.delayScoops = 100;
+    await expect(runBuy(STABLE_TOKEN, 30_000_000n, { maxPolls: 5 })).rejects.toThrow(/0\/1 settled after 5 checks/);
+  });
+
+  it("stops when the operator declines", async () => {
+    await expect(runBuy(STABLE_TOKEN, 30_000_000n, { approve: async () => false })).rejects.toThrow(/Aborted/);
+    expect(world.provider.submissions.length).toBe(0);
   });
 });

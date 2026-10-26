@@ -493,19 +493,19 @@ async function collectChangeMa(provider: Provider, address: Core.Address, multia
         let quantity = utxo.output().amount().coin();
         console.log(`    have += '${asset}': ${quantity}`);
         have.addAsset(asset, quantity);
-        for (const [asset, quantity] of utxo.output().amount().multiasset()) {
+        for (const [asset, quantity] of utxo.output().amount().multiasset() ?? []) {
           console.log(`    have += '${asset}': ${quantity}`);
           have.addAsset(asset, quantity);
         }
         change.add(utxo);
       } else {
         console.log(`  Adding this utxo`);
-        for (const [k, v] of utxo.output().amount().multiasset()) {
+        for (const [k, v] of utxo.output().amount().multiasset() ?? []) {
           console.log(`  Ma ${k} ${v}`);
         }
-        let quantity = utxo.output().amount().multiasset().get(Core.AssetId(asset));
+        let quantity = utxo.output().amount().multiasset()?.get(Core.AssetId(asset));
         if (quantity) {
-          for (const [asset, quantity] of utxo.output().amount().multiasset()) {
+          for (const [asset, quantity] of utxo.output().amount().multiasset()!) {
             console.log(`    have += '${asset}': ${quantity}`);
             have.addAsset(asset, quantity);
           }
@@ -3729,7 +3729,7 @@ async function buildSwap(options: BuildSwapOptions) {
     scooperFee: 2_500_000,
   });
 
-  let lockedValue = new Core.Value(4500000);
+  let lockedValue = new Core.Value(SWAP_RIDER_AND_FEE);
   if (offeredAsset == "ada.lovelace") {
     lockedValue.setCoin(BigInt(lockedValue.coin()) + options.swapOfferAmount);
   } else {
@@ -3938,18 +3938,15 @@ interface SwapQueryProvider {
   getProtocolParamsWithScripts(version: EContractVersion): Promise<{ blueprint: { validators: { title: string, hash: string }[] } }>,
 }
 
-export interface ConvertAssetsOptions {
+// Ada locked in each order on top of what it offers, to cover the scooper fee
+// and the payout's min-ADA
+const SWAP_RIDER_AND_FEE = 4_500_000n;
+
+// What placing orders and waiting for them to settle needs
+interface OrderOptions {
   blaze: Blaze<Provider, Wallet>,
   provider: Provider,
-  queryProvider: SwapQueryProvider,
   walletAddress: Address,
-  // Asset id (concatenated or dotted) -> { pool: ident of the pool to sell it into }
-  preferredPools: Record<string, { pool: string }>,
-  // Asset id -> amount, as written to a rewards-out file. Ada isn't swapped,
-  // but counts toward the total.
-  assets: Record<string, string | bigint>,
-  // Skip assets whose swap would return less than this many lovelace
-  minSwapReturn: bigint,
   // Decides whether a signed order transaction should be submitted. Returning
   // false aborts the whole run.
   approve: (tx: Transaction) => Promise<boolean>,
@@ -3959,6 +3956,121 @@ export interface ConvertAssetsOptions {
   pollIntervalMs: number,
   maxPolls: number,
   sleep: (ms: number) => Promise<void>,
+}
+
+// Submit the given order transactions, wait for them to confirm, then wait for
+// every order to be scooped. Orders are recognized by the identifier in their
+// payout's inline datum. Returns the value of each payout; identifiers of the
+// settled orders are added to settledOrders.
+async function settleOrders(options: OrderOptions, txs: Transaction[], identifiers: Set<string>, settledOrders: Set<string>): Promise<Core.Value[]> {
+  let { blaze, provider } = options;
+  for (let completed of txs) {
+    await blaze.signTransaction(completed);
+    if (!(await options.approve(completed))) {
+      throw new Error("Aborted: not all list-order transactions were submitted");
+    }
+    await blaze.submitTransaction(completed);
+    console.log(`Submitted ${completed.getId()}`);
+  }
+
+  let confirmations = await Promise.all(txs.map((completed) =>
+    provider.awaitTransactionConfirmation(completed.getId(), options.confirmationTimeoutMs)));
+  if (!confirmations.every(c => c === true)) {
+    throw new Error("Not all list-order transactions have settled");
+  }
+  console.log("All list-order transactions confirmed; waiting for scoops");
+
+  let payouts = [];
+  for (let poll = 1; ; poll++) {
+    let unspentOutputs = await provider.getUnspentOutputs(options.walletAddress);
+    for (let utxo of unspentOutputs) {
+      let thisDatum = utxo.output().datum()?.asInlineData()?.asBoundedBytes()?.toHex();
+      if (!thisDatum) {
+        continue;
+      }
+      if (!settledOrders.has(thisDatum) && identifiers.has(thisDatum)) {
+        settledOrders.add(thisDatum);
+        payouts.push(utxo.output().amount());
+        console.log(`Order ${thisDatum} settled in tx ${utxo.input().transactionId()}`);
+      }
+    }
+    if (payouts.length >= identifiers.size) {
+      return payouts;
+    }
+    if (poll >= options.maxPolls) {
+      throw new Error(`Gave up waiting for orders to settle: ${payouts.length}/${identifiers.size} settled after ${poll} checks`);
+    }
+    console.log(`${payouts.length}/${identifiers.size} orders settled; checking again in ${options.pollIntervalMs / 1000}s`);
+    await options.sleep(options.pollIntervalMs);
+  }
+}
+
+export interface BuyWithAdaOptions extends OrderOptions {
+  queryProvider: SwapQueryProvider,
+  // Asset id (concatenated or dotted) -> { pool: ident of the pool to trade it in }
+  preferredPools: Record<string, { pool: string }>,
+  // The asset to buy, and how many lovelace to spend on it
+  asset: string,
+  amount: bigint,
+}
+
+// Buy an asset with ada through its preferred pool, which must pair it with
+// ada. Returns what the order paid out: the asset bought, and the ada left over
+// from the rider less the scooper's fee (so usually negative).
+export async function buyWithAda(options: BuyWithAdaOptions): Promise<Multiasset> {
+  let { blaze, provider, queryProvider } = options;
+  let wallet = options.walletAddress;
+  let asset = fromDot(options.asset);
+
+  let ident = options.preferredPools[asset]?.pool;
+  if (!ident) {
+    throw new Error(`No preferred pools entry was provided for this asset (${asset})`);
+  }
+  let pool = await queryProvider.findPoolDataByIdent({ ident });
+  if (!pool) {
+    throw new Error(`Failed to find pool by ident (${ident})`);
+  }
+  if (pool.assetA.assetId != "ada.lovelace" || fromDot(pool.assetB.assetId) != asset) {
+    throw new Error(`Preferred pool ${ident} trades ${pool.assetA.assetId} for ${pool.assetB.assetId}, not ada for ${asset}`);
+  }
+  if (!SUPPORTED_SWAP_VERSIONS.includes(pool.version)) {
+    throw new Error(`Preferred pool ${ident} for ${asset} is a ${pool.version} pool; only ${SUPPORTED_SWAP_VERSIONS.join(" and ")} pools are supported`);
+  }
+
+  // Enough for the offer and rider, with some left over for the fee
+  let need = new Multiasset();
+  need.addAsset("", options.amount + SWAP_RIDER_AND_FEE + 3_000_000n);
+  let change = await collectChangeMa(provider, wallet, need);
+
+  let identifier = new Uint8Array(randomTxId());
+  let tx = await buildSwap({
+    blaze,
+    pool,
+    changeUtxos: change,
+    offeredAsset: "ada.lovelace",
+    walletAddress: wallet,
+    swapOfferAmount: options.amount,
+    orderScriptAddress: await getOrderScriptAddress(queryProvider, pool.version, provider.network, wallet),
+    identifier,
+  });
+  let completed = await tx.complete();
+
+  let [payout] = await settleOrders(options, [completed], new Set([identifier.toHex()]), new Set());
+  let received = new Multiasset();
+  received.addCardanoSdkValue(payout);
+  received.addAsset("", -SWAP_RIDER_AND_FEE);
+  return received;
+}
+
+export interface ConvertAssetsOptions extends OrderOptions {
+  queryProvider: SwapQueryProvider,
+  // Asset id (concatenated or dotted) -> { pool: ident of the pool to sell it into }
+  preferredPools: Record<string, { pool: string }>,
+  // Asset id -> amount, as written to a rewards-out file. Ada isn't swapped,
+  // but counts toward the total.
+  assets: Record<string, string | bigint>,
+  // Skip assets whose swap would return less than this many lovelace
+  minSwapReturn: bigint,
 }
 
 export const defaultConvertAssetsTiming = {
@@ -4001,66 +4113,16 @@ export async function convertAssetsToAda(options: ConvertAssetsOptions): Promise
 
     assetsToConvert = {};
 
-    // Submit all of the asset-swap list-order txes
-    for (let completed of txs) {
-      await blaze.signTransaction(completed);
-      if (!(await options.approve(completed))) {
-        throw new Error("Aborted: not all list-order transactions were submitted");
-      }
-      await blaze.submitTransaction(completed);
-      console.log(`Submitted ${completed.getId()}`);
-    }
-
-    // Wait for all of the list-order txes to settle
-    let awaitedTxs = [];
-    for (let completed of txs) {
-      awaitedTxs.push(provider.awaitTransactionConfirmation(completed.getId(), options.confirmationTimeoutMs));
-    }
-    let confirmations = await Promise.all(awaitedTxs);
-    if (!confirmations.every(c => c === true)) {
-      throw new Error("Not all list-order transactions have settled");
-    }
-    console.log("All list-order transactions confirmed; waiting for scoops");
-
-    // Wait for all datums to appear in the wallet
-    let settledCount = 0;
-    for (let poll = 1; ; poll++) {
-      let unspentOutputs = await provider.getUnspentOutputs(wallet);
-      for (let utxo of unspentOutputs) {
-        let thisDatum = utxo.output().datum()?.asInlineData()?.asBoundedBytes()?.toHex();
-        if (!thisDatum) {
-          continue;
-        }
-
-        // A new settled order was just discovered; update funds state
-        if (!settledOrders.has(thisDatum) && identifiers.has(thisDatum)) {
-          settledOrders.add(thisDatum);
-          settledCount++;
-          let thisValue = utxo.output().amount();
-
-          // If thisValue is pure ada, then we need to tally the surplus ada
-          // (i.e. the total ada minus rider and fee). Otherwise, there should
-          // be no surplus ada and some native token, and we should add that to
-          // the new assetsToConvert.
-          let riderAndFee = 4_500_000n;
-          let netAda = thisValue.coin() - riderAndFee;
-          adaEarned += netAda;
-          console.log(`Order ${thisDatum} settled in tx ${utxo.input().transactionId()}: ${netAda} lovelace net`);
-          if (thisValue.multiasset()) {
-            for (let [asset, quantity] of thisValue.multiasset()) {
-              assetsToConvert[asset] = (BigInt(assetsToConvert[asset] ?? 0n)) + quantity;
-            }
-          }
+    for (let payout of await settleOrders(options, txs, identifiers, settledOrders)) {
+      // A payout that is pure ada is surplus ada over the rider and fee.
+      // Otherwise it holds some native token, which needs another round.
+      let netAda = payout.coin() - SWAP_RIDER_AND_FEE;
+      adaEarned += netAda;
+      if (payout.multiasset()) {
+        for (let [asset, quantity] of payout.multiasset()) {
+          assetsToConvert[asset] = (BigInt(assetsToConvert[asset] ?? 0n)) + quantity;
         }
       }
-      if (settledCount >= identifiers.size) {
-        break;
-      }
-      if (poll >= options.maxPolls) {
-        throw new Error(`Gave up waiting for orders to settle: ${settledCount}/${identifiers.size} settled after ${poll} checks`);
-      }
-      console.log(`${settledCount}/${identifiers.size} orders settled; checking again in ${options.pollIntervalMs / 1000}s`);
-      await options.sleep(options.pollIntervalMs);
     }
 
     // All orders have settled. We now know the total ada earned (possibly
@@ -4094,140 +4156,23 @@ async function convertAssets(argv: any) {
   }
 }
 
+// Buy SUNDAE (or --asset) for yield farming with --amount lovelace
 async function doSwap(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
-
-  let toPay = new Multiasset(); 
-  toPay.addAsset("", 4_500_000n + BigInt(argv.swapOfferAmount));
-
-  let wallet = Core.addressFromBech32(argv.walletAddress);
-
-  let changes = await collectChangeMa(provider, wallet, toPay);
-
-  let queryProvider;
-  if (argv.mainnet) {
-    queryProvider = new QueryProviderSundaeSwap("mainnet");
-  } else {
-    queryProvider = new QueryProviderSundaeSwap("preview");
-  }
-  let pools = await queryProvider.findPoolDataByAssetPair(
-    argv.assetA,
-    argv.assetB,
-  );
-  if (pools.length == 0) {
-    throw new Error("Couldn't find pool for this asset pair");
-  }
-
-  // Get best pool by comparing quantity of asset A reserve
-  let bestPool = undefined;
-  for (let pool of pools) {
-    if (pool.version != EContractVersion.V3) {
-      continue;
-    }
-    if (!bestPool) {
-      bestPool = pool;
-    } else {
-      if (pool.liquidity.aReserve > bestPool.liquidity.aReserve) {
-        bestPool = pool;
-      }
-    }
-  }
-
-  let identifier = new Uint8Array(randomTxId());
-  let tx = await buildSwap({
-    blaze: blaze,
-    pool: bestPool,
-    changeUtxos: changes,
-    walletAddress: wallet,
-    swapOfferAmount: BigInt(argv.swapOfferAmount),
-    offeredAsset: argv.assetA,
-    orderScriptAddress: Core.addressFromBech32(argv.orderScriptAddress),
-    identifier,
+  let received = await buyWithAda({
+    blaze,
+    provider,
+    queryProvider: new QueryProviderSundaeSwap(argv.mainnet ? "mainnet" : "preview"),
+    walletAddress: Core.addressFromBech32(argv.walletAddress),
+    preferredPools: JSON.parse(fs.readFileSync(argv.preferredPoolsFile, "utf8")),
+    asset: argv.asset ?? MAINNET_SUNDAE,
+    amount: BigInt(argv.amount),
+    approve: await cliApprover(!!argv.forceSubmit),
+    ...defaultConvertAssetsTiming,
   });
-  
-  let submittedTx = null;
-  if (argv.forceSubmit) {
-    let completed = await tx.complete();
-    await blaze.signTransaction(completed);
-    await blaze.submitTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    console.log("Submitted");
-  } else if (argv.submit) {
-    let completed = await tx.complete();
-    await blaze.signTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    const response = await prompt("Type 'submit' to submit");
-    if (response == "submit") {
-      await blaze.submitTransaction(completed);
-      console.log("Submitted");
-      submittedTx = completed;
-    }
-  } else {
-    console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
-    let completed = await tx.complete();
-    console.log(`(Completed tx: ${completed.toCbor()})`);
-  }
-
-  if (!submittedTx) {
-    return;
-  }
-
-  let confirmed = await provider.awaitTransactionConfirmation(submittedTx.getId(), 300_000);
-  if (!confirmed) {
-    throw new Error("list-order transaction did not settle");
-  }
-  console.log("list-order transaction confirmed; waiting for scoop");
-
-  let assetsEarned = new Multiasset();
-  let done = false;
-  while (!done) {
-    let unspentOutputs = await provider.getUnspentOutputs(wallet);
-    for (let utxo of unspentOutputs) {
-      let thisDatum = utxo.output().datum()?.asInlineData()?.asBoundedBytes()?.toHex();
-      if (!thisDatum) {
-        continue;
-      }
-
-      if (identifier.toHex() == thisDatum) {
-        let thisValue = utxo.output().amount();
-        let riderAndFee = 4_500_000n;
-        let netAda = thisValue.coin() - riderAndFee;
-        assetsEarned.addAsset("", netAda);
-        console.log(`Order ${thisDatum} settled in tx ${utxo.input().transactionId()}: ${netAda} lovelace net`);
-        if (thisValue.multiasset()) {
-          for (let [asset, quantity] of thisValue.multiasset()) {
-            assetsEarned.addAsset(asset, quantity);
-          }
-        }
-        done = true;
-      }
-    }
-    if (!done) {
-      console.log(`order not yet settled; checking again in 60s`);
-      await delay(60_000);
-    }
-  }
-  console.log(`Assets earned: ${assetsEarned.toJSON()}`);
-  await Bun.write(argv.rewardsOut, assetsEarned.toJSON());
-}
-
-// Given a file describing amounts of various assets in a wallet, swap each of
-// those assets to ada. This is useful after withdrawing the rewards from the
-// stable pools, since stable pools can have fees in non-ada assets.
-async function swapAssetsToAda(argv) {
-  let query;
-  if (argv.mainnet) {
-    query = new QueryProviderSundaeSwap("mainnet");
-  } else {
-    query = new QueryProviderSundaeSwap("preview");
-  }
-  //let pools = await query.findPoolDataByAssetPair("", "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d77.53554e444145");
-  let pools = await query.findPoolDataByAssetPair("", "1f3aec8bfe7ea4fe14c5f121e2a92e301afe414147860d557cac7e34.5553444378");
-  if (!pools || pools.length == 0) {
-    console.log(`No pools found`);
-  }
-  for (let pool of pools) {
-    console.log(`Pool found: ${pool.ident}`);
+  console.log(`Assets received: ${received.toJSON()}`);
+  if (argv.rewardsOut) {
+    await Bun.write(argv.rewardsOut, received.toJSON());
   }
 }
 
