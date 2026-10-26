@@ -25,7 +25,16 @@ import {
   submitAndAwaitWithRetry,
   type Blueprint,
 } from "./index.ts";
-import { decodePoolDatum, decoder, encodePoolDatum, withEncoderHex } from "./codec.ts";
+import {
+  decodePoolDatum,
+  decodeSettingsDatum,
+  decodeStablePoolDatum,
+  decoder,
+  encodePoolDatum,
+  encodeSettingsDatum,
+  encodeStablePoolDatum,
+  withEncoderHex,
+} from "./codec.ts";
 import { fromHex } from "./util.ts";
 
 // These tests run the real auto-withdrawal against an emulated ledger with the
@@ -34,6 +43,7 @@ import { fromHex } from "./util.ts";
 // lagging behind, and transactions that get dropped or confirmed late.
 
 const blueprint: Blueprint = decodeBlueprint(fs.readFileSync(new URL("./preview.blueprint.json", import.meta.url), "utf8"));
+const stableBlueprint: Blueprint = decodeBlueprint(fs.readFileSync(new URL("./plutus-stable-preview.json", import.meta.url), "utf8"));
 
 // Fees that a simulated scoop adds to the pool
 const SCOOP_FEE = 2_000_000n;
@@ -52,9 +62,32 @@ type SubmitBehavior =
   // Lands on chain, but the next two confirmation checks don't see it
   | "confirmLate";
 
+// A copy of a pool output with SCOOP_FEE more fees, as a scoop would leave it
+function scoopV3Pool(output: TransactionOutput): TransactionOutput {
+  let datum = decodePoolDatum(decoder(fromHex(output.datum()!.asInlineData()!.toCbor())));
+  datum.protocolFees += SCOOP_FEE;
+  let value = new Core.Value(output.amount().coin() + SCOOP_FEE, output.amount().multiasset());
+  let scooped = new TransactionOutput(output.address(), value);
+  scooped.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(withEncoderHex(encodePoolDatum, datum)))));
+  return scooped;
+}
+
+function scoopStablePool(output: TransactionOutput): TransactionOutput {
+  let datum = decodeStablePoolDatum(decoder(fromHex(output.datum()!.asInlineData()!.toCbor())));
+  datum.protocolFees[0] += SCOOP_FEE;
+  let value = new Core.Value(output.amount().coin() + SCOOP_FEE, output.amount().multiasset());
+  let scooped = new TransactionOutput(output.address(), value);
+  scooped.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(withEncoderHex(encodeStablePoolDatum, datum)))));
+  return scooped;
+}
+
 // An emulator provider whose submissions can be scripted to misbehave. Every
 // accepted transaction is put in a block immediately.
 class ContentionProvider extends EmulatorProvider {
+  constructor(emulator: Emulator, private poolScriptHash: string, private scoopPool: (output: TransactionOutput) => TransactionOutput) {
+    super(emulator);
+  }
+
   // Behaviors for upcoming submissions, consumed in order. Submissions beyond
   // the script behave normally.
   script: (SubmitBehavior | "normal")[] = [];
@@ -107,23 +140,17 @@ class ContentionProvider extends EmulatorProvider {
   scoopPoolsSpentBy(tx: Transaction) {
     for (let input of tx.body().inputs().values()) {
       let output = this.emulator.getOutput(input);
-      if (!output || output.address().getProps().paymentPart?.hash != blueprint.poolSpend.hash) {
+      if (!output || output.address().getProps().paymentPart?.hash != this.poolScriptHash) {
         continue;
       }
-      let datum = decodePoolDatum(decoder(fromHex(output.datum()!.asInlineData()!.toCbor())));
-      datum.protocolFees += SCOOP_FEE;
-      let value = new Core.Value(output.amount().coin() + SCOOP_FEE, output.amount().multiasset());
-      let scooped = new TransactionOutput(output.address(), value);
-      scooped.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(withEncoderHex(encodePoolDatum, datum)))));
-
       let spent = new TransactionUnspentOutput(input, output);
       this.emulator.removeUtxo(input);
       this.emulator.addUtxo(new TransactionUnspentOutput(
         new TransactionInput(TransactionId(crypto.randomBytes(32).toString("hex")), 0n),
-        scooped,
+        this.scoopPool(output),
       ));
       for (let [asset] of output.amount().multiasset() ?? []) {
-        if (asset.startsWith(blueprint.poolSpend.hash)) {
+        if (asset.startsWith(this.poolScriptHash)) {
           this.stale.set(asset, { utxo: spent, remaining: this.staleReadsAfterScoop });
         }
       }
@@ -139,11 +166,87 @@ interface World {
   signer: string,
   poolAddress: Core.Address,
   references: TransactionInput[],
-  // Pool ident -> protocol fees at the start
+  // Pool ident -> protocol fees at the start (v3 pools only)
   initialFees: Map<string, bigint>,
 }
 
-async function makeWorld(): Promise<World> {
+// Stable pools trade ADA against this token
+const STABLE_TOKEN = Core.AssetId("ab".repeat(28) + "7553444d"); // "uSDM"
+
+// Each stable pool starts with 10 ADA of flat fees, 1 ADA of asset A (ADA)
+// fees and 5 tokens of asset B fees
+const STABLE_FEES: [bigint, bigint, bigint] = [10_000_000n, 1_000_000n, 5_000_000n];
+
+// Pool outputs must delegate to one of the authorized staking keys in the
+// settings; the fixture settings authorize the wallet key
+function stablePoolAddress(stakeKeyHash: string): Core.Address {
+  return new Core.Address({
+    type: Core.AddressType.BasePaymentScriptStakeKey,
+    networkId: NetworkId.Testnet,
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: Hash28ByteBase16(stableBlueprint.poolSpend.hash),
+    },
+    delegationPart: {
+      type: Core.CredentialType.KeyHash,
+      hash: Hash28ByteBase16(stakeKeyHash),
+    },
+  });
+}
+
+function makeStablePool(address: Core.Address): [TransactionUnspentOutput, Buffer] {
+  let identifier = crypto.randomBytes(28);
+  let [policy, name] = [STABLE_TOKEN.slice(0, 56), STABLE_TOKEN.slice(56)];
+  let datum = withEncoderHex(encodeStablePoolDatum, {
+    identifier,
+    assetPair: [
+      [Buffer.alloc(0), Buffer.alloc(0)],
+      [fromHex(policy), fromHex(name)],
+    ],
+    circulatingLp: 100_000_000n,
+    lpFeeBasisPoints: [5n, 5n],
+    protocolFeeBasisPoints: [5n, 5n],
+    feeManager: null,
+    marketOpen: 0n,
+    protocolFees: STABLE_FEES,
+    linearAmplification: 200n,
+    sumInvariant: 200_000_000n,
+    linearAmplificationManager: null,
+  });
+  let nft = Core.AssetId(stableBlueprint.poolSpend.hash + "000de140" + identifier.toString("hex"));
+  // 100 ADA and 100 tokens of liquidity, plus the fees
+  let output = new TransactionOutput(address, new Core.Value(
+    100_000_000n + STABLE_FEES[0] + STABLE_FEES[1],
+    new Map([[STABLE_TOKEN, 100_000_000n + STABLE_FEES[2]], [nft, 1n]]),
+  ));
+  output.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(datum))));
+  let input = new TransactionInput(TransactionId(crypto.randomBytes(32).toString("hex")), 0n);
+  return [new TransactionUnspentOutput(input, output), identifier];
+}
+
+// Like makeScriptRef, but for the PlutusV3 stable scripts
+function makeV3ScriptRef(address: Core.Address, validator: string): TransactionUnspentOutput {
+  let output = new TransactionOutput(address, new Core.Value(100_000_000n));
+  output.setScriptRef(Core.Script.newPlutusV3Script(new Core.PlutusV3Script(HexBlob(validator))));
+  // The stable scripts expect the settings to be the first reference input, and
+  // makeSettings gives it a tx id starting with 00, so sort these after it
+  let txId = "ff" + crypto.randomBytes(31).toString("hex");
+  let input = new TransactionInput(TransactionId(txId), 0n);
+  return new TransactionUnspentOutput(input, output);
+}
+
+// makeSettings encodes the extensions field as Void, but the live settings were
+// migrated to an empty map (see updateSettingsDatum), and the stable scripts
+// require one
+function withMapExtensions(settings: TransactionUnspentOutput): TransactionUnspentOutput {
+  let datum = decodeSettingsDatum(decoder(fromHex(settings.output().datum()!.asInlineData()!.toCbor())));
+  datum.extensions = Buffer.from([0xa0]);
+  let output = new TransactionOutput(settings.output().address(), settings.output().amount());
+  output.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(withEncoderHex(encodeSettingsDatum, datum)))));
+  return new TransactionUnspentOutput(settings.input(), output);
+}
+
+async function makeWorld(kind: "v3" | "stable" = "v3"): Promise<World> {
   await Core.initCrypto();
   let skey = Core.Ed25519PrivateKey.fromNormalBytes(crypto.randomBytes(32));
   let pkh = await (await skey.toPublic()).hash();
@@ -153,33 +256,48 @@ async function makeWorld(): Promise<World> {
   for (let i = 0; i < 5; i++) {
     emulator.addUtxo(makeChange(wallet, 20_000_000n));
   }
-  emulator.addUtxo(makeSettings(blueprint, pkh));
+  // Stable pools use the v3 settings
+  emulator.addUtxo(withMapExtensions(makeSettings(blueprint, pkh)));
 
-  // Each pool starts with 20 ADA of protocol fees
   let initialFees = new Map();
   let poolAddress;
-  for (let i = 0; i < 3; i++) {
-    let [pool, ident] = makeRandomPool(blueprint, pkh);
-    emulator.addUtxo(pool);
-    initialFees.set(ident.toString("hex"), 20_000_000n);
-    poolAddress = pool.output().address();
+  let references;
+  let poolBlueprint;
+  if (kind == "v3") {
+    // Each pool starts with 20 ADA of protocol fees
+    for (let i = 0; i < 3; i++) {
+      let [pool, ident] = makeRandomPool(blueprint, pkh);
+      emulator.addUtxo(pool);
+      initialFees.set(ident.toString("hex"), 20_000_000n);
+      poolAddress = pool.output().address();
+    }
+    references = [
+      makeScriptRef(wallet, HexBlob(blueprint.poolSpend.validator)),
+      makeScriptRef(wallet, HexBlob(blueprint.poolManage.validator)),
+    ];
+    poolBlueprint = blueprint;
+  } else {
+    for (let i = 0; i < 2; i++) {
+      emulator.addUtxo(makeStablePool(stablePoolAddress(pkh.hex()))[0]);
+    }
+    poolAddress = stablePoolAddress(pkh.hex());
+    references = [
+      makeV3ScriptRef(wallet, stableBlueprint.poolSpend.validator),
+      makeV3ScriptRef(wallet, stableBlueprint.poolManage.validator),
+    ];
+    poolBlueprint = stableBlueprint;
   }
-
-  let references = [
-    makeScriptRef(wallet, HexBlob(blueprint.poolSpend.validator)),
-    makeScriptRef(wallet, HexBlob(blueprint.poolManage.validator)),
-  ];
   references.forEach((r) => emulator.addUtxo(r));
 
   // The withdrawal goes through the pool.manage stake script, which the ledger
   // requires to be registered
   let poolManageAccount = Core.RewardAccount.fromCredential({
     type: Core.CredentialType.ScriptHash,
-    hash: Hash28ByteBase16(blueprint.poolManage.hash),
+    hash: Hash28ByteBase16(poolBlueprint.poolManage.hash),
   }, NetworkId.Testnet);
   emulator.accounts.set(poolManageAccount, 0n);
 
-  let provider = new ContentionProvider(emulator);
+  let provider = new ContentionProvider(emulator, poolBlueprint.poolSpend.hash, kind == "v3" ? scoopV3Pool : scoopStablePool);
   let blaze = await Blaze.from(provider, new HotSingleWallet(Ed25519PrivateNormalKeyHex(skey.hex()), NetworkId.Testnet, provider));
 
   return {
@@ -194,13 +312,13 @@ async function makeWorld(): Promise<World> {
   };
 }
 
-function runAutoWithdraw(world: World, needed: bigint, overrides: { approve?: (tx: Transaction) => Promise<boolean>, maxAttempts?: number } = {}) {
+function runAutoWithdraw(world: World, needed: bigint, overrides: { approve?: (tx: Transaction) => Promise<boolean>, maxAttempts?: number, stable?: boolean } = {}) {
   return autoWithdrawRewards({
     poolAddress: world.poolAddress.toBech32(),
     needed,
     walletAddress: world.wallet,
     blueprint,
-    stableBlueprint: undefined,
+    stableBlueprint: overrides.stable ? stableBlueprint : undefined,
     blaze: world.blaze,
     provider: world.provider,
     references: world.references,
@@ -214,7 +332,7 @@ function runAutoWithdraw(world: World, needed: bigint, overrides: { approve?: (t
     signers: world.signer,
     txLogDir: "",
     todo: undefined,
-    stable: false,
+    stable: overrides.stable ?? false,
   });
 }
 
@@ -357,6 +475,68 @@ describe("autoWithdrawRewards", () => {
     expect(sum(withdrawnPerPool(world).values())).toBe(1_000_000n);
     expect(rewards).toEqual([]);
     expect(change.length).toBe(1);
+  });
+});
+
+// Pool ident -> [flat, asset A, asset B] protocol fees currently on the ledger
+function currentStableFees(world: World): Map<string, [bigint, bigint, bigint]> {
+  let fees = new Map();
+  for (let utxo of world.emulator.utxos()) {
+    if (utxo.output().address().toBytes() != world.poolAddress.toBytes()) {
+      continue;
+    }
+    let datum = decodeStablePoolDatum(decoder(fromHex(utxo.output().datum()!.asInlineData()!.toCbor())));
+    fees.set(datum.identifier.toString("hex"), datum.protocolFees);
+  }
+  return fees;
+}
+
+describe("autoWithdrawRewards on stable pools", () => {
+  let world: World;
+
+  beforeEach(async () => {
+    world = await makeWorld("stable");
+  });
+
+  // Everything but 3 ADA of flat fees is withdrawn, and the treasury takes
+  // 9/10 of each part, so 1/10 of each is withheld
+  const WITHHELD_ADA = (STABLE_FEES[0] - 3_000_000n + STABLE_FEES[1]) / 10n;
+  const WITHHELD_TOKENS = STABLE_FEES[2] / 10n;
+
+  function expectRewards(rewards: TransactionUnspentOutput[]) {
+    expect(rewards.length).toBe(2);
+    for (let reward of rewards) {
+      expect(reward.output().amount().multiasset()?.get(STABLE_TOKEN)).toBe(WITHHELD_TOKENS);
+      // The builder tops this output up to min-ADA from change, so it can hold
+      // more ADA than was withheld
+      expect(reward.output().amount().coin()).toBeGreaterThanOrEqual(WITHHELD_ADA);
+    }
+  }
+
+  it("withdraws all fees but the flat 3 ADA from every pool", async () => {
+    let { rewards } = await runAutoWithdraw(world, 0n, { stable: true });
+
+    expect(world.provider.submissions.length).toBe(2);
+    for (let fees of currentStableFees(world).values()) {
+      expect(fees).toEqual([3_000_000n, 0n, 0n]);
+    }
+    expectRewards(rewards);
+  });
+
+  it("retries a withdrawal whose pool was scooped first", async () => {
+    world.provider.script = ["scoopFirst"];
+    world.provider.staleReadsAfterScoop = 1;
+    let { rewards } = await runAutoWithdraw(world, 0n, { stable: true });
+
+    // One rejection after the scoop, one against the stale pool, then success
+    expect(world.provider.submissions.length).toBe(4);
+    // The amounts were fixed before the scoop, so the scoop's fees stay behind
+    let remaining = [...currentStableFees(world).values()].map((f) => f[0]).sort();
+    expect(remaining).toEqual([3_000_000n, 3_000_000n + SCOOP_FEE].sort());
+    for (let fees of currentStableFees(world).values()) {
+      expect(fees.slice(1)).toEqual([0n, 0n]);
+    }
+    expectRewards(rewards);
   });
 });
 
