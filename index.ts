@@ -263,7 +263,7 @@ async function findChangeMany(provider: Provider, address: Core.Address, amount:
   return change;
 }
 
-class Multiasset {
+export class Multiasset {
   ma: Map<string, bigint>;
   
   public constructor() {
@@ -3872,150 +3872,9 @@ export interface BuildSwapOptions {
   identifier: Uint8Array | undefined,
 }
 
-export interface BuildChainedSwapOptions {
-  blaze: Blaze<Provider, Wallet>,
-  changeUtxos: Core.TransactionUnspentOutput[],
-  pool1: PoolData,
-  pool2: PoolData,
-  walletAddress: Address,
-  swapOfferAmount: BigInt,
-  offeredAsset: string,
-  orderScriptAddress: Address,
-}
-
 function fromDot(asset: string) {
   return asset.replaceAll(".", "");
 }
-
-async function buildChainedSwap(options: BuildChainedSwapOptions) {
-  const tx = options.blaze.newTransaction();
-
-  for (const change of options.changeUtxos) {
-    tx.addInput(change);
-  }
-
-  let swapType = { type: ESwapType.MARKET, slippage: 0.03 };
-  let offeredAsset = options.offeredAsset;
- 
-  let otherAsset = undefined;
-  let isAtoB = true;
-  if (offeredAsset == options.pool1.assetA.assetId) {
-    otherAsset = options.pool1.assetB.assetId;
-  } else if (offeredAsset == options.pool1.assetB.assetId) {
-    otherAsset = options.pool1.assetA.assetId;
-    isAtoB = false;
-  } else { 
-    throw new Error(`offered asset ${offeredAsset} is neither of the assets in the pool's coin pair (${options.pool.assetA.assetId}, ${options.pool.assetB.assetId})`);
-  }
-
-  if (otherAsset != options.pool2.assetA.assetId && otherAsset != options.pool2.assetB.assetId) {
-    throw new Error(`pool of second leg of chained swap does not match contain the other asset of the first pool`);
-  }
-
-  // Estimate the amount of otherAsset recieved for the offered amount of
-  // offeredAsset
-  let estimatedSwapReturn = undefined;
-
-  if (options.pool1.version == EContractVersion.V3) {
-    //  pool_take * difference * order_give / (
-    //    pool_give * 10000 + order_give * difference
-    //  )
-    let orderGive = options.swapOfferAmount;
-    let poolTake = undefined;
-    let poolGive = undefined;
-    let difference = options.pool1.protocolFee;
-    if (isAtoB) {
-      poolTake = options.pool1.liquidity.bReserve;
-      poolGive = options.pool1.liquidity.aReserve;
-    } else {
-      poolTake = options.pool1.liquidity.aReserve;
-      poolGive = options.pool1.liquidity.bReserve;
-    }
-    estimatedSwapReturn =
-      poolTake * (1 - fee) * orderGive / (poolGive + orderGive * (1 - fee));
-  } else if (options.pool1.version == EContractVersion.StableSwap) {
-    // FIXME
-  }
-
-  // Build the datum of the second leg, first
-  let sup2 = new AssetAmount(
-      estimatedSwapReturn,
-      { assetId: otherAsset, decimals: 6 },
-  );
-  let swap2Args = {
-    suppliedAsset: sup2,
-    swapType,
-    pool: options.pool2,
-    orderAddresses: {
-      DestinationAddress: { address: options.walletAddress.toBech32(), datum: { type: EDatumType.NONE }, },
-    },
-  };
-
-  let config2 = new SwapConfig(swap2Args);
-  let { pool22, orderAddresses2, suppliedAsset2, minReceivable2 } = config2.buildArgs();
-
-  let datumBuilder = new DatumBuilderV3();
-  let { inline2 } = datumBuilder.buildSwapDatum({
-    ident: pool22.ident,
-    destinationAddress: orderAddresses2.DestinationAddress,
-    ownerAddress: options.walletAddress.toBech32(),
-    order: { minReceived: minReceivable2, offered: suppliedAsset2 },
-    scooperFee: 2_500_000,
-  });
-
-  // Now build the datum of the first leg, embedding the second leg's datum
-  let sup1 = new AssetAmount(
-      options.swapOfferAmount,
-      { assetId: offeredAsset, decimals: 6 },
-  );
-  let swap1Args = {
-    suppliedAsset: sup1,
-    swapType,
-    pool: options.pool1,
-    orderAddresses: {
-      DestinationAddress: { address: options.orderScriptAddress.toBech32(), datum: { type: EDatumType.Inline, bytes: inline2 }, },
-    },
-  };
-
-  let config1 = new SwapConfig(swap1Args);
-  let { pool, orderAddresses, suppliedAsset, minReceivable } = config1.buildArgs();
-
-  let { inline1 } = datumBuilder.buildSwapDatum({
-    ident: pool1.ident,
-    destinationAddress: orderAddresses.DestinationAddress,
-    ownerAddress: options.walletAddress.toBech32(),
-    order: { minReceived: minReceivable, offered: suppliedAsset },
-    scooperFee: 2_500_000,
-  });
-
-  let lockedValue = new Core.Value(7000000);
-  if (offeredAsset == "ada.lovelace") {
-    lockedValue.setCoin(BigInt(lockedValue.coin()) + options.swapOfferAmount);
-  } else {
-    let lockedValueMa = new Map();
-    lockedValueMa.set(fromDot(offeredAsset), options.swapOfferAmount);
-    lockedValue.setMultiasset(lockedValueMa);
-  }
-
-  tx.lockAssets(
-    options.orderScriptAddress,
-    lockedValue,
-    Core.PlutusData.fromCbor(Core.HexBlob(inline1)),
-  );
-
-  tx.useCoinSelector((inputs, dearth) => {
-    return {
-      selectedInputs: [],
-      selectedValue: new Value(0n),
-      inputs: [],
-      leftoverInputs: [],
-    }
-  });
-
-  return tx;
-}
-
-
 
 async function buildSwap(options: BuildSwapOptions) {
   const tx = options.blaze.newTransaction();
@@ -4121,58 +3980,6 @@ function withDestinationInlineDatum(orderDatum: Core.PlutusData, datum: Core.Plu
   let inlineDatum = Core.PlutusData.newConstrPlutusData(new Core.ConstrPlutusData(2n, inlineFields));
   let newDestination = replaceField(destination, 1, inlineDatum);
   return replaceField(order, 3, newDestination);
-}
-
-function getBestPool(pools: PoolData[]) {
-  if (pools.length == 0) {
-    throw new Error("No pools");
-  }
-  // Get best pool by comparing quantity of asset A reserve
-  let bestPool = undefined;
-  for (let pool of pools) {
-    if (pool.version != EContractVersion.V3) {
-      continue;
-    }
-    if (!bestPool) {
-      bestPool = pool;
-    } else {
-      if (pool.liquidity.aReserve > bestPool.liquidity.aReserve) {
-        bestPool = pool;
-      }
-    }
-  }
-  return bestPool;
-}
-
-// Given an asset, find all pools A and B such that
-//   A has pair (asset, otherAsset), and
-//   B has pair (ada, otherAsset)
-async function findChainedPathToAda(queryProvider: QueryProvider, asset: string) {
-  let poolsHavingAsset = await queryProvider.findPoolDataByAssetId(asset);
-  let poolsHavingAda = await queryProvider.findPoolDataByAssetId("ada.lovelace");
-
-  let links = new Map();
-  for (let poolHavingAda of poolsHavingAda) {
-    links.set(poolHavingAda.assetB, poolHavingAda);
-  }
-
-  let candidates = [];
-  for (let poolHavingAsset of poolsHavingAsset) {
-    let otherAsset = poolHavingAsset.assetA;
-    if (poolHavingAsset.assetA == asset) {
-      otherAsset = poolHavingAsset.assetB;
-    }
-    let adaLink = links.get(poolHavingAsset.otherAsset);
-    if (adaLink) {
-      candidates.push([poolHavingAsset, adaLink]);
-    }
-  }
-
-  // TODO: How to choose a best candidate? 
-
-  if (candidates.length == 0) {
-    throw new Error("Couldn't find a path to trade this asset to ada");
-  }
 }
 
 // Convert a concatenated policy+name asset id into the dotted form used by the
@@ -4320,27 +4127,52 @@ async function buildAssetSwaps(blaze, provider, wallet, queryProvider, preferred
   };
 }
 
-async function convertAssets(argv: any) {
-  let { blaze, provider } = await setupBlaze(argv);
+// The parts of the SundaeSwap query provider that converting assets needs
+interface SwapQueryProvider {
+  findPoolDataByIdent(query: { ident: string }): Promise<PoolData>,
+  getProtocolParamsWithScripts(version: EContractVersion): Promise<{ blueprint: { validators: { title: string, hash: string }[] } }>,
+}
 
-  let assetsData = fs.readFileSync(argv.assetsFile, "utf8");
-  let wallet = Core.addressFromBech32(argv.walletAddress);
+export interface ConvertAssetsOptions {
+  blaze: Blaze<Provider, Wallet>,
+  provider: Provider,
+  queryProvider: SwapQueryProvider,
+  walletAddress: Address,
+  // Asset id (concatenated or dotted) -> { pool: ident of the pool to sell it into }
+  preferredPools: Record<string, { pool: string }>,
+  // Asset id -> amount, as written to a rewards-out file. Ada is ignored.
+  assets: Record<string, string | bigint>,
+  // Skip assets whose swap would return less than this many lovelace
+  minSwapReturn: bigint,
+  // Decides whether a signed order transaction should be submitted. Returning
+  // false aborts the whole run.
+  approve: (tx: Transaction) => Promise<boolean>,
+  confirmationTimeoutMs: number,
+  // How long to wait between checks for settled orders, and how many checks to
+  // make before giving up
+  pollIntervalMs: number,
+  maxPolls: number,
+  sleep: (ms: number) => Promise<void>,
+}
 
-  let preferredPoolsJson = fs.readFileSync(argv.preferredPoolsFile, "utf8");
-  let preferredPools = JSON.parse(preferredPoolsJson);
+export const defaultConvertAssetsTiming = {
+  confirmationTimeoutMs: 300_000,
+  pollIntervalMs: 60_000,
+  maxPolls: 120,
+  sleep: delay,
+};
 
-  let queryProvider;
-  if (argv.mainnet) {
-    queryProvider = new QueryProviderSundaeSwap("mainnet");
-  } else {
-    queryProvider = new QueryProviderSundaeSwap("preview");
-  }
-
-  let assetsToConvert = JSON.parse(assetsData);
+// Swap every non-ada asset to ada through its preferred pool, and report how
+// much ada was earned net of order fees. A preferred pool may pay out another
+// token rather than ada, in which case that token is swapped in a further round.
+export async function convertAssetsToAda(options: ConvertAssetsOptions): Promise<bigint> {
+  let { blaze, provider, queryProvider, preferredPools } = options;
+  let wallet = options.walletAddress;
+  let assetsToConvert = options.assets;
 
   let orderScriptAddresses = new Map<EContractVersion, Core.Address>();
   for (let version of SUPPORTED_SWAP_VERSIONS) {
-    let address = await getOrderScriptAddress(queryProvider, version, argv.mainnet ? 1 : 0, wallet);
+    let address = await getOrderScriptAddress(queryProvider, version, provider.network, wallet);
     orderScriptAddresses.set(version, address);
     console.log(`${version} order script address: ${address.toBech32()}`);
   }
@@ -4349,29 +4181,24 @@ async function convertAssets(argv: any) {
   // Identifiers of all orders settled so far; their payouts may be spent by
   // later rounds of swaps
   let settledOrders = new Set<string>();
-  let minSwapReturn = BigInt(argv.minSwapReturn ?? 1);
-  let mustSwap = true;
-  while (mustSwap) {
-    assetsToConvert = await filterDust(queryProvider, preferredPools, assetsToConvert, minSwapReturn);
+  while (true) {
+    assetsToConvert = await filterDust(queryProvider, preferredPools, assetsToConvert, options.minSwapReturn);
     if (Object.keys(assetsToConvert).length == 0) {
       break;
     }
 
-    let adaChange = await findChangeMany(provider, wallet, 7_000_000n, Object.keys(assetsToConvert).length);
+    let adaChange = await findChangeMany(provider, wallet, 7_000_000n, BigInt(Object.keys(assetsToConvert).length));
 
     // For each asset that we need to convert, build a list-order
     // swapping that asset to its preferred pool
     let { txs, identifiers } = await buildAssetSwaps(blaze, provider, wallet, queryProvider, preferredPools, assetsToConvert, adaChange, orderScriptAddresses, settledOrders);
 
-    mustSwap = false;
     assetsToConvert = {};
 
     // Submit all of the asset-swap list-order txes
     for (let completed of txs) {
       await blaze.signTransaction(completed);
-      console.log(`${completed.toCbor()}`);
-      const response = await prompt("Type 'submit' to submit");
-      if (response != "submit") {
+      if (!(await options.approve(completed))) {
         throw new Error("Aborted: not all list-order transactions were submitted");
       }
       await blaze.submitTransaction(completed);
@@ -4381,7 +4208,7 @@ async function convertAssets(argv: any) {
     // Wait for all of the list-order txes to settle
     let awaitedTxs = [];
     for (let completed of txs) {
-      awaitedTxs.push(provider.awaitTransactionConfirmation(completed.getId(), 300_000));
+      awaitedTxs.push(provider.awaitTransactionConfirmation(completed.getId(), options.confirmationTimeoutMs));
     }
     let confirmations = await Promise.all(awaitedTxs);
     if (!confirmations.every(c => c === true)) {
@@ -4391,7 +4218,7 @@ async function convertAssets(argv: any) {
 
     // Wait for all datums to appear in the wallet
     let settledCount = 0;
-    while (true) {
+    for (let poll = 1; ; poll++) {
       let unspentOutputs = await provider.getUnspentOutputs(wallet);
       for (let utxo of unspentOutputs) {
         let thisDatum = utxo.output().datum()?.asInlineData()?.asBoundedBytes()?.toHex();
@@ -4415,7 +4242,7 @@ async function convertAssets(argv: any) {
           console.log(`Order ${thisDatum} settled in tx ${utxo.input().transactionId()}: ${netAda} lovelace net`);
           if (thisValue.multiasset()) {
             for (let [asset, quantity] of thisValue.multiasset()) {
-              assetsToConvert[asset] = (assetsToConvert[asset] ?? 0n) + quantity;
+              assetsToConvert[asset] = (BigInt(assetsToConvert[asset] ?? 0n)) + quantity;
             }
           }
         }
@@ -4423,19 +4250,36 @@ async function convertAssets(argv: any) {
       if (settledCount >= identifiers.size) {
         break;
       }
-      console.log(`${settledCount}/${identifiers.size} orders settled; checking again in 60s`);
-      await delay(60_000);
+      if (poll >= options.maxPolls) {
+        throw new Error(`Gave up waiting for orders to settle: ${settledCount}/${identifiers.size} settled after ${poll} checks`);
+      }
+      console.log(`${settledCount}/${identifiers.size} orders settled; checking again in ${options.pollIntervalMs / 1000}s`);
+      await options.sleep(options.pollIntervalMs);
     }
 
     // All orders have settled. We now know the total ada earned (possibly
     // negative) and the new assetsToConvert (possibly empty if all swaps were
-    // to ada). If assetsToConvert is empty, stop here and report the total ada
-    // earned across all iterations. Otherwise, issue a new batch of swaps.
-    if (Object.keys(assetsToConvert).length != 0) {
-      mustSwap = true;
-    }
+    // to ada). If assetsToConvert is empty, the next round's dust filter stops
+    // the loop. Otherwise, issue a new batch of swaps.
   }
   console.log(`Earned ADA (lovelace): ${adaEarned}`);
+  return adaEarned;
+}
+
+async function convertAssets(argv: any) {
+  let { blaze, provider } = await setupBlaze(argv);
+  let queryProvider = new QueryProviderSundaeSwap(argv.mainnet ? "mainnet" : "preview");
+  let adaEarned = await convertAssetsToAda({
+    blaze,
+    provider,
+    queryProvider,
+    walletAddress: Core.addressFromBech32(argv.walletAddress),
+    preferredPools: JSON.parse(fs.readFileSync(argv.preferredPoolsFile, "utf8")),
+    assets: JSON.parse(fs.readFileSync(argv.assetsFile, "utf8")),
+    minSwapReturn: BigInt(argv.minSwapReturn ?? 1),
+    approve: await cliApprover(!!argv.forceSubmit),
+    ...defaultConvertAssetsTiming,
+  });
   if (argv.convertAssetsOut) {
     await Bun.write(argv.convertAssetsOut, adaEarned.toString());
   }
