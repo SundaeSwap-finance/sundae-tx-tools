@@ -1368,7 +1368,7 @@ function makePoolNft(poolScriptHash: Buffer, identifier: Buffer): Buffer {
   return Buffer.concat([poolScriptHash, prefix, identifier]);
 }
 
-function makeChange(myAddress: Address, amount: bigint): Core.TransactionUnspentOutput {
+export function makeChange(myAddress: Address, amount: bigint): Core.TransactionUnspentOutput {
   let txid = randomTxId();
   txid[0] = 0x11;
   let input =
@@ -1422,7 +1422,7 @@ function paymentAddress(keyHash: Ed25519KeyHash): CodecAddress {
   return newAddress(Buffer.from(keyHash.bytes()), 121n);
 }
 
-function makeSettings(bp: Blueprint, keyHash: Ed25519KeyHash): Core.TransactionUnspentOutput {
+export function makeSettings(bp: Blueprint, keyHash: Ed25519KeyHash): Core.TransactionUnspentOutput {
   let settingsScriptHash = Buffer.from(bp.settingsSpend.hash, "hex");
   let settingsAddr = new Core.Address({
     type: Core.AddressType.EnterpriseScript,
@@ -1477,7 +1477,7 @@ function makeSettings(bp: Blueprint, keyHash: Ed25519KeyHash): Core.TransactionU
   return settings;
 }
 
-function makeRandomPool(bp: Blueprint, keyHash: Ed25519KeyHash): [Core.TransactionUnspentOutput, Buffer] {
+export function makeRandomPool(bp: Blueprint, keyHash: Ed25519KeyHash): [Core.TransactionUnspentOutput, Buffer] {
   let poolScriptHash = Buffer.from(bp.poolSpend.hash, "hex");
   let poolAddr = new Core.Address({
     type: Core.AddressType.BasePaymentScriptStakeKey,
@@ -1550,7 +1550,7 @@ function makeRandomPool(bp: Blueprint, keyHash: Ed25519KeyHash): [Core.Transacti
   return [pool, identifier];
 }
 
-function makeScriptRef(address: Address, validator: HexBlob) {
+export function makeScriptRef(address: Address, validator: HexBlob) {
   let txid = randomTxId();
   txid[0] = 0xff;
 
@@ -2217,7 +2217,7 @@ interface BuildWithdrawPoolRewards {
   txLogDir: string,
 }
 
-async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
+export async function buildWithdrawPoolRewards(options: BuildWithdrawPoolRewards) {
   let targetPool = await findPoolByIdent(options.provider, options.poolAddress, options.targetPool);
   if (!targetPool) {
     throw new Error(`Couldn't find pool utxo with target ident ${options.targetPool}`);
@@ -2489,22 +2489,111 @@ async function queryStablePools(provider: Provider, poolAddress: string): Promis
 }
 
 
-// This takes a *builder* as an argument to allow automatic retrying in cases
-// where there is contention for one of the tx inputs.
-async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, buildTx: () => Promise<Transaction>): Promise<{tx: Transaction, id: string}> {
-  let confirmed = false;
-  while (!confirmed) {
-    let tx = await buildTx();
-    let hash = await blaze.submitTransaction(tx);
-    console.log(`Submitted (${hash})...`);
-    confirmed = await blaze.provider.awaitTransactionConfirmation(hash, 60_000);
-    if (confirmed) {
-      console.log(`Confirmed ${hash}`);
-      return { tx, id: confirmed };
-    } else {
-      console.log(`Couldn't confirm transaction ${hash}; retrying`);
+interface RetryOptions {
+  // Decides whether a signed transaction should be submitted. Returning false
+  // aborts the whole run.
+  approve: (tx: Transaction) => Promise<boolean>,
+  maxAttempts: number,
+  retryDelayMs: number,
+  confirmationTimeoutMs: number,
+}
+
+const defaultRetryOptions = {
+  maxAttempts: 10,
+  retryDelayMs: 20_000,
+  confirmationTimeoutMs: 120_000,
+};
+
+// Approves every transaction after a single confirmation up front
+// (--forceSubmit), or asks about each transaction individually (--submit).
+async function cliApprover(forceSubmit: boolean): Promise<(tx: Transaction) => Promise<boolean>> {
+  if (forceSubmit) {
+    const response = await prompt("Do you really want to force submission of all transactions? (yes/no)");
+    if (response != "yes") {
+      throw new Error("Aborted by operator");
+    }
+    return async (tx) => {
+      console.log(`${tx.toCbor()}`);
+      return true;
+    };
+  }
+  return async (tx) => {
+    console.log(`${tx.toCbor()}`);
+    return (await prompt("Type 'submit' to submit")) == "submit";
+  };
+}
+
+async function findConfirmed(provider: Provider, attempts: { tx: Transaction, id: string }[]): Promise<Transaction | undefined> {
+  for (let attempt of attempts) {
+    // No timeout means check once without waiting
+    if (await provider.awaitTransactionConfirmation(Core.TransactionId(attempt.id))) {
+      return attempt.tx;
     }
   }
+  return undefined;
+}
+
+// Builds, submits and waits for a transaction, rebuilding and resubmitting
+// until one attempt is confirmed on chain. This takes a *builder* so that each
+// attempt picks up the current state of any contended input, e.g. a pool that a
+// scooper spent just before we submitted.
+//
+// Every attempt must spend a common input (for withdrawals, the change utxo),
+// so that at most one attempt can ever land. That makes it safe to give up
+// waiting on an attempt and retry: if the earlier attempt lands late, the retry
+// can't also land, and we find the earlier one before the next rebuild.
+async function submitAndAwaitWithRetry(blaze: Blaze<Provider, Wallet>, options: RetryOptions, buildTx: () => Promise<Transaction>): Promise<Transaction> {
+  let attempts: { tx: Transaction, id: string }[] = [];
+  let lastError: unknown = undefined;
+  for (let attempt = 1; attempt <= options.maxAttempts; attempt++) {
+    if (attempt > 1) {
+      await delay(options.retryDelayMs);
+      let landed = await findConfirmed(blaze.provider, attempts);
+      if (landed) {
+        console.log(`Earlier attempt ${landed.getId()} was confirmed`);
+        return landed;
+      }
+    }
+
+    let tx;
+    try {
+      tx = await buildTx();
+      await blaze.signTransaction(tx);
+    } catch (error) {
+      console.log(`Attempt ${attempt}: couldn't build transaction: ${error}`);
+      lastError = error;
+      continue;
+    }
+
+    if (!(await options.approve(tx))) {
+      throw new Error("Aborted by operator");
+    }
+
+    let id;
+    try {
+      id = await blaze.submitTransaction(tx);
+    } catch (error) {
+      console.log(`Attempt ${attempt}: submission failed: ${error}`);
+      lastError = error;
+      continue;
+    }
+    console.log(`Submitted (${id})...`);
+    attempts.push({ tx, id });
+
+    if (await blaze.provider.awaitTransactionConfirmation(id, options.confirmationTimeoutMs)) {
+      console.log(`Confirmed ${id}`);
+      return tx;
+    }
+    console.log(`Couldn't confirm transaction ${id}; retrying`);
+    lastError = new Error(`transaction ${id} was not confirmed`);
+  }
+
+  let landed = await findConfirmed(blaze.provider, attempts);
+  if (landed) {
+    return landed;
+  }
+  let submitted = attempts.map((a) => a.id).join(", ") || "none";
+  throw new Error(`Gave up after ${options.maxAttempts} attempts (submitted: ${submitted}): ${lastError}`);
 }
 
 type SigningKey =
@@ -2721,12 +2810,13 @@ async function doPayouts(options: PayoutOptions) {
     blueprint: options.blueprint,
     blaze: options.blaze,
     provider: options.provider,
-    references: options.references,
-    submit: options.submit || false,
-    forceSubmit: options.forceSubmit || false,
+    references: readReferences(options.references),
+    retry: await cliRetryOptions(options.submit, options.forceSubmit),
     withheldAddress: options.withheldAddress,
     signers: options.protocolFeesSigners,
     txLogDir: options.txLogDir,
+    stable: false,
+    stableBlueprint: undefined,
     todo: { pools: protocolFeesTodo, change: protocolFeesChange },
   };
 
@@ -2817,18 +2907,39 @@ interface AutoWithdrawOptions {
   stableBlueprint: Blueprint | undefined,
   blaze: Blaze<Provider, Wallet>,
   provider: Provider,
-  references: string,
-  submit: boolean | undefined,
-  forceSubmit: boolean | undefined,
+  references: TransactionInput[],
+  // Undefined means a dry run: build the withdrawals without submitting them
+  retry: RetryOptions | undefined,
   withheldAddress: Address,
   signers: string,
   txLogDir: string,
   todo: { pools: PoolTodo[], change: Core.TransactionUnspentOutput[] } | undefined,
   stable: boolean | undefined,
-  stableBlueprint: Blueprint,
 }
 
-export function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet>, provider: Provider): AutoWithdrawOptions {
+// A references file is a JSON list of { txHash, index } pointing at the utxos
+// that hold the reference scripts
+function readReferences(path: string): TransactionInput[] {
+  let referenceRefs = [];
+  for (let utxoRef of JSON.parse(fs.readFileSync(path, "utf8"))) {
+    referenceRefs.push(
+      new TransactionInput(
+        TransactionId.fromHexBlob(utxoRef.txHash),
+        BigInt(utxoRef.index),
+      )
+    );
+  }
+  return referenceRefs;
+}
+
+async function cliRetryOptions(submit: boolean | undefined, forceSubmit: boolean | undefined): Promise<RetryOptions | undefined> {
+  if (!submit && !forceSubmit) {
+    return undefined;
+  }
+  return { ...defaultRetryOptions, approve: await cliApprover(!!forceSubmit) };
+}
+
+export async function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet>, provider: Provider): Promise<AutoWithdrawOptions> {
   let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
   let stableBlueprint = undefined;
   if (argv.stable) {
@@ -2848,13 +2959,13 @@ export function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, Wallet
     stableBlueprint: stableBlueprint,
     blaze: blaze,
     provider: provider,
-    references: argv.references,
-    submit: argv.submit,
-    forceSubmit: argv.forceSubmit,
+    references: readReferences(argv.references),
+    retry: await cliRetryOptions(argv.submit, argv.forceSubmit),
     signers: argv.signers,
     withheldAddress: Core.addressFromBech32(argv.withheldAddress),
     txLogDir: argv.txLogDir,
     stable: argv.stable,
+    todo: undefined,
   }
 }
 
@@ -3438,6 +3549,16 @@ function getOutputs(txBody: TransactionBody): Core.TransactionUnspentOutput[] {
   return ret;
 }
 
+// Withdrawal txs lay out their outputs as [pool, treasury, withheld?, change].
+// The builders leave out the withheld output when there's nothing to withhold,
+// so it can't be assumed to be at index 2.
+export function withdrawalOutputs(tx: Transaction): { reward: Core.TransactionUnspentOutput | undefined, walletOutputs: Core.TransactionUnspentOutput[] } {
+  let outs = getOutputs(tx.body());
+  let walletOutputs = outs.slice(2);
+  let reward = walletOutputs.length > 1 ? walletOutputs[0] : undefined;
+  return { reward, walletOutputs };
+}
+
 export async function makeChangeUtxos(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
   const tx = blaze.newTransaction();
@@ -3485,13 +3606,13 @@ export async function makeChangeUtxos(argv: any) {
   }
 }
 
-export async function autoWithdrawRewards(options: AutoWithdrawOptions): TransactionUnspentOutput[] {
+export async function autoWithdrawRewards(options: AutoWithdrawOptions): Promise<{ change: Core.TransactionUnspentOutput[], rewards: Core.TransactionUnspentOutput[] }> {
   // 1. 'queryPools': Compute optimal set of pools to withdraw from:
   //   a. Query all withdrawable pools
   //   b. Sort by amount of withdrawable funds
   //   c. Select prefix that satisfies needed amount of funds, call the length of this prefix N
   // 2. 'findChangeMany': Provision N change utxos in our wallet
-  // 3. For each pool, build and submit a withdrawal TX using the `i`th change utxo (disabling automatic change selection), retrying if the submission fails due to scooper contention (usually at least one of the withdrawals needs to be retried in practice).
+  // 3. For each pool, build and submit a withdrawal TX using the `i`th change utxo (disabling automatic change selection), retrying if the submission fails due to scooper contention, until the withdrawal is confirmed on chain (see submitAndAwaitWithRetry).
   
   let todo;
   let change;
@@ -3525,30 +3646,12 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
   }
   let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
 
-  let referenceData = fs.readFileSync(options.references, "utf8");
-  let referenceRefs = [];
-  for (let utxoRef of JSON.parse(referenceData)) {
-    referenceRefs.push(
-      new TransactionInput(
-        TransactionId.fromHexBlob(utxoRef.txHash),
-        BigInt(utxoRef.index),
-      )
-    );
-  }
   let references: Core.TransactionUnspentOutput[] = [];
-  if (referenceRefs.length > 0) {
-    references = await options.provider.resolveUnspentOutputs(referenceRefs);
+  if (options.references.length > 0) {
+    references = await options.provider.resolveUnspentOutputs(options.references);
   }
 
   let totalWithdrawn = 0n;
-
-  if (options.forceSubmit) {
-    const response = await prompt("Do you really want to force submission of all transactions? (yes/no)");
-    if (response != "yes") {
-      console.log("Aborting");
-      return;
-    }
-  }
 
   let withdrawnChange = [];
   let rewards = [];
@@ -3603,64 +3706,30 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Transac
       };
     }
 
-    if (options.forceSubmit) {
-      let tx = await submitAndAwaitWithRetry(options.blaze, async () => {
-        let tx = undefined;
-        if (options.stable) {
-          tx = await buildWithdrawStablePoolRewards(withdrawOptions);
-        } else {
-          tx = await buildWithdrawPoolRewards(withdrawOptions);
-        }
-        await options.blaze.signTransaction(tx);
-        console.log(`${tx.toCbor()}`);
-        return tx;
-      });
-      let outs = getOutputs(tx.body());
-      withdrawnChange.push(outs[2], outs[3]);
-      rewards.push(outs[2]);
-    } else if (options.submit) {
-      let retry = true;
-      let tx = undefined;
-      while (retry) {
-        if (options.stable) {
-          tx = await buildWithdrawStablePoolRewards(withdrawOptions);
-        } else {
-          tx = await buildWithdrawPoolRewards(withdrawOptions);
-        }
-        await options.blaze.signTransaction(tx);
-        console.log(`${tx.toCbor()}`);
-        const response = await prompt("Type 'submit' to submit");
-        if (response == "submit") {
-          try {
-            let submittedId = await options.blaze.submitTransaction(tx);
-            console.log(`Submitted ${submittedId}`);
-            retry = false;
-          } catch (error) {
-            console.log(error);
-          }
-        } else {
-          console.log("Aborting auto-withdrawal");
-          process.exit(0);
-        }
-      }
-      let outs = getOutputs(tx.body());
-      withdrawnChange.push(outs[2], outs[3]);
-      rewards.push(outs[2]);
-    } else {
-      let tx = undefined;
+    let buildTx = async () => {
       if (options.stable) {
-        tx = await buildWithdrawStablePoolRewards(withdrawOptions);
+        return await buildWithdrawStablePoolRewards(withdrawOptions);
       } else {
-        tx = await buildWithdrawPoolRewards(withdrawOptions);
+        return await buildWithdrawPoolRewards(withdrawOptions);
       }
-      let outs = getOutputs(tx.body());
-      withdrawnChange.push(outs[2], outs[3]);
-      rewards.push(outs[2]);
+    };
+
+    let tx;
+    if (options.retry) {
+      // Every attempt for this pool spends thisChange, so at most one can land
+      tx = await submitAndAwaitWithRetry(options.blaze, options.retry, buildTx);
+    } else {
+      tx = await buildTx();
       console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
       if (options.txLogDir) {
         let txid = tx.getId();
         fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-protocol-fees-${i}.tx`, tx.toCbor());
       }
+    }
+    let { reward, walletOutputs } = withdrawalOutputs(tx);
+    withdrawnChange.push(...walletOutputs);
+    if (reward) {
+      rewards.push(reward);
     }
     totalWithdrawn += todo[i].amount;
     console.log(`Total withdrawn so far: ${totalWithdrawn}`);
@@ -4519,7 +4588,7 @@ if (import.meta.main) {
     await debugConditionedScoop(argv);
   } else if (argv.autoWithdrawRewards) {
     let { blaze, provider } = await setupBlaze(argv);
-    let opts = makeAutoWithdrawOptions(argv, blaze, provider);
+    let opts = await makeAutoWithdrawOptions(argv, blaze, provider);
     let { rewards } = await autoWithdrawRewards(opts);
     let totalWithdrawn = new Multiasset();
     for (let change of rewards) {
