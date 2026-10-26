@@ -3368,7 +3368,7 @@ export async function makeChangeUtxos(argv: any) {
 
   let count = BigInt(argv.count);
   let amount = BigInt(argv.amount);
-  let address = Core.addressFromBech32(argv.address);
+  let address = Core.addressFromBech32(argv.walletAddress ?? argv.address);
   
   let changes = await collectChangeAllowingAssets(provider, address, count * amount);
 
@@ -3409,7 +3409,7 @@ export async function makeChangeUtxos(argv: any) {
   }
 }
 
-export async function autoWithdrawRewards(options: AutoWithdrawOptions): Promise<{ change: Core.TransactionUnspentOutput[], rewards: Core.TransactionUnspentOutput[] }> {
+export async function autoWithdrawRewards(options: AutoWithdrawOptions): Promise<{ change: Core.TransactionUnspentOutput[], rewards: Core.TransactionUnspentOutput[], withheld: Multiasset }> {
   // 1. 'queryPools': Compute optimal set of pools to withdraw from:
   //   a. Query all withdrawable pools
   //   b. Sort by amount of withdrawable funds
@@ -3458,6 +3458,7 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Promise
 
   let withdrawnChange = [];
   let rewards = [];
+  let withheld = new Multiasset();
 
   for (let i = 0; i < todo.length; i++) {
     let thisChange = change[i];
@@ -3534,12 +3535,25 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Promise
     if (reward) {
       rewards.push(reward);
     }
+    // The amount withheld from the treasury. The withheld output alone can
+    // overstate it, since Blaze tops that output up to min-ADA out of the
+    // change, so count the withheld and change outputs together, less the
+    // change spent and plus the fee it paid. (If Blaze ever topped up the
+    // treasury output instead, that would come off this amount.)
+    if (thisChange.output().amount().multiasset()?.size) {
+      throw new Error(`Change ${thisChange.input().transactionId()}#${thisChange.input().index()} holds tokens`);
+    }
+    for (let output of walletOutputs) {
+      withheld.addCardanoSdkValue(output.output().amount());
+    }
+    withheld.addAsset("", tx.body().fee() - thisChange.output().amount().coin());
     totalWithdrawn += todo[i].amount;
     console.log(`Total withdrawn so far: ${totalWithdrawn}`);
   }
   return {
     change: withdrawnChange,
     rewards: rewards,
+    withheld: withheld,
   };
 }
 
@@ -3931,7 +3945,8 @@ export interface ConvertAssetsOptions {
   walletAddress: Address,
   // Asset id (concatenated or dotted) -> { pool: ident of the pool to sell it into }
   preferredPools: Record<string, { pool: string }>,
-  // Asset id -> amount, as written to a rewards-out file. Ada is ignored.
+  // Asset id -> amount, as written to a rewards-out file. Ada isn't swapped,
+  // but counts toward the total.
   assets: Record<string, string | bigint>,
   // Skip assets whose swap would return less than this many lovelace
   minSwapReturn: bigint,
@@ -3953,8 +3968,8 @@ export const defaultConvertAssetsTiming = {
   sleep: delay,
 };
 
-// Swap every non-ada asset to ada through its preferred pool, and report how
-// much ada was earned net of order fees. A preferred pool may pay out another
+// Swap every non-ada asset to ada through its preferred pool, and report the
+// total ada: what was given as ada plus what the swaps earned net of order fees. A preferred pool may pay out another
 // token rather than ada, in which case that token is swapped in a further round.
 export async function convertAssetsToAda(options: ConvertAssetsOptions): Promise<bigint> {
   let { blaze, provider, queryProvider, preferredPools } = options;
@@ -4053,14 +4068,15 @@ export async function convertAssetsToAda(options: ConvertAssetsOptions): Promise
     // to ada). If assetsToConvert is empty, the next round's dust filter stops
     // the loop. Otherwise, issue a new batch of swaps.
   }
-  console.log(`Earned ADA (lovelace): ${adaEarned}`);
-  return adaEarned;
+  let total = BigInt(options.assets[""] ?? 0n) + adaEarned;
+  console.log(`Earned ADA (lovelace): ${adaEarned}, total ${total}`);
+  return total;
 }
 
 async function convertAssets(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
   let queryProvider = new QueryProviderSundaeSwap(argv.mainnet ? "mainnet" : "preview");
-  let adaEarned = await convertAssetsToAda({
+  let adaTotal = await convertAssetsToAda({
     blaze,
     provider,
     queryProvider,
@@ -4072,7 +4088,9 @@ async function convertAssets(argv: any) {
     ...defaultConvertAssetsTiming,
   });
   if (argv.convertAssetsOut) {
-    await Bun.write(argv.convertAssetsOut, adaEarned.toString());
+    let out = new Multiasset();
+    out.addAsset("", adaTotal);
+    await Bun.write(argv.convertAssetsOut, out.toJSON());
   }
 }
 
@@ -4236,18 +4254,8 @@ if (import.meta.main) {
   } else if (argv.autoWithdrawRewards) {
     let { blaze, provider } = await setupBlaze(argv);
     let opts = await makeAutoWithdrawOptions(argv, blaze, provider);
-    let { rewards } = await autoWithdrawRewards(opts);
-    let totalWithdrawn = new Multiasset();
-    for (let change of rewards) {
-      let amount = change.output().amount();
-      totalWithdrawn.addAsset("", amount.coin());
-      if (amount.multiasset()) {
-        for (const [asset, quantity] of amount.multiasset()) {
-          totalWithdrawn.addAsset(asset, quantity);
-        }
-      }
-    }
-    await Bun.write(argv.rewardsOut, totalWithdrawn.toJSON());
+    let { withheld } = await autoWithdrawRewards(opts);
+    await Bun.write(argv.rewardsOut, withheld.toJSON());
   } else if (argv.testAutoWithdraw) {
     await testAutoWithdraw(argv);
   } else if (argv.doPayout) {

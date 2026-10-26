@@ -88,12 +88,13 @@ describe("autoWithdrawRewards", () => {
   });
 
   it("withdraws the needed amount across pools, largest first", async () => {
-    let { rewards } = await runAutoWithdraw(world, NEEDED);
+    let { rewards, withheld } = await runAutoWithdraw(world, NEEDED);
 
     let withdrawn = withdrawnPerPool(world);
     expect([...withdrawn.values()].sort()).toEqual([17_000_000n, 17_000_000n, 10_000_000n].sort());
     expect(world.provider.submissions.length).toBe(3);
     expect(coins(rewards)).toBe(sum([...withdrawn.values()].map(withheldShare)));
+    expect(withheld.get("")).toBe(sum([...withdrawn.values()].map(withheldShare)));
   });
 
   it("retries a withdrawal whose pool was scooped first", async () => {
@@ -157,7 +158,8 @@ describe("autoWithdrawRewards", () => {
 
   it("reports no rewards when the whole withdrawal goes to the treasury", async () => {
     // The treasury takes at least 1 ADA, so nothing is withheld
-    let { rewards, change } = await runAutoWithdraw(world, 1_000_000n);
+    let { rewards, change, withheld } = await runAutoWithdraw(world, 1_000_000n);
+    expect(withheld.get("")).toBe(0n);
 
     expect(sum(withdrawnPerPool(world).values())).toBe(1_000_000n);
     expect(rewards).toEqual([]);
@@ -217,6 +219,16 @@ describe("autoWithdrawRewards on stable pools", () => {
       expect(treasury.multiasset()?.get(STABLE_TOKEN)).toBe(fees[2] - withheld(fees).tokens);
     }
     expectRewards(rewards, fees);
+  });
+
+  it("reports exactly what was withheld, not the min-ADA top-up", async () => {
+    let { rewards, withheld: reported } = await runAutoWithdraw(world, 0n, { stable: true });
+
+    // Each reward output was topped up past what was withheld
+    let expected = withheld(STABLE_FEES);
+    expect(coins(rewards)).toBeGreaterThan(2n * expected.ada);
+    expect(reported.get("")).toBe(2n * expected.ada);
+    expect(reported.get(STABLE_TOKEN)).toBe(2n * expected.tokens);
   });
 
   it("withdraws all fees but the flat 3 ADA from every pool", async () => {

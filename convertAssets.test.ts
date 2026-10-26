@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "bun:test";
 import * as crypto from "node:crypto";
 import { Core } from "@blaze-cardano/sdk";
 import { EContractVersion } from "@sundaeswap/core";
-import { Multiasset, convertAssetsToAda, type ConvertAssetsOptions } from "./index.ts";
+import { convertAssetsToAda, type ConvertAssetsOptions } from "./index.ts";
 import {
   FakeQueryProvider,
   FakeScooper,
@@ -101,14 +101,15 @@ describe("convertAssetsToAda", () => {
     market = makeMarket(world);
   });
 
-  it("swaps a token to ada and reports the ada earned net of fees", async () => {
+  it("swaps a token to ada and reports the total ada, net of fees", async () => {
     fund(world, STABLE_TOKEN, 3_000_000n);
-    let earned = await runConvert(world, market, { "": "5000000", [STABLE_TOKEN]: "3000000" });
+    let total = await runConvert(world, market, { "": "5000000", [STABLE_TOKEN]: "3000000" });
 
     let received = swapOutput(1_000_000_000n, 2_000_000_000n, 3_000_000n);
     expect(market.scooper.filled.length).toBe(1);
     expect(market.scooper.filled[0].received).toEqual(["ada.lovelace", received]);
-    expect(earned).toBe(received - market.scooper.protocolFee);
+    // The ada given plus the swap's proceeds
+    expect(total).toBe(5_000_000n + received - market.scooper.protocolFee);
     expect(walletBalance(world, STABLE_TOKEN)).toBe(0n);
   });
 
@@ -168,24 +169,22 @@ describe("convertAssetsToAda", () => {
 });
 
 describe("withdrawing stable pool fees and converting them to ada", () => {
-  it("converts exactly the withdrawn tokens", async () => {
+  it("converts exactly the withdrawn tokens and totals the ada", async () => {
     let world = await makeWorld("stable");
     let market = makeMarket(world);
 
-    let { rewards } = await runAutoWithdraw(world, 0n, { stable: true });
+    let { withheld } = await runAutoWithdraw(world, 0n, { stable: true });
     // As written to the rewards-out file and read back by convertAssets
-    let withdrawn = new Multiasset();
-    for (let reward of rewards) {
-      withdrawn.addCardanoSdkValue(reward.output().amount());
-    }
-    let assets = JSON.parse(withdrawn.toJSON());
+    let assets = JSON.parse(withheld.toJSON());
 
-    let earned = await runConvert(world, market, assets);
+    let total = await runConvert(world, market, assets);
 
-    let tokens = BigInt(assets[STABLE_TOKEN]);
-    expect(tokens).toBeGreaterThan(0n);
+    // Each pool withholds a tenth of its fees
+    let ada = 2n * ((STABLE_FEES[0] - 3_000_000n) / 10n + STABLE_FEES[1] / 10n);
+    let tokens = 2n * (STABLE_FEES[2] / 10n);
+    expect(assets).toEqual({ "": ada.toString(), [STABLE_TOKEN]: tokens.toString() });
     expect(market.scooper.filled.map((f) => f.offered)).toEqual([[sdkAssetId(STABLE_TOKEN), tokens]]);
-    expect(earned).toBe(swapOutput(1_000_000_000n, 2_000_000_000n, tokens) - market.scooper.protocolFee);
+    expect(total).toBe(ada + swapOutput(1_000_000_000n, 2_000_000_000n, tokens) - market.scooper.protocolFee);
     // The fixture settings use the wallet as the treasury, so only the
     // treasury's share of the withdrawn tokens is left. Those outputs carry the
     // treasury's Void datum, which keeps them out of the conversion.
