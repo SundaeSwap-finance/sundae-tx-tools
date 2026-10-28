@@ -72,6 +72,7 @@ import {
   stringify,
 } from "./util.ts";
 import { buildReport, parseScooperCsv, reportToJson } from "./report.ts";
+import { applyConfig, readConfig } from "./config.ts";
 
 import minimist from "minimist";
 
@@ -2843,6 +2844,17 @@ export interface BuildPayoutOptions {
 
 const MAINNET_SUNDAE = "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d7753554e444145";
 
+// --sundaeAssetId, which only defaults on mainnet
+export function sundaeAssetId(argv: any): string {
+  if (argv.sundaeAssetId) {
+    return argv.sundaeAssetId;
+  }
+  if (argv.mainnet) {
+    return MAINNET_SUNDAE;
+  }
+  throw new Error("Expected --sundaeAssetId (or sundaeAssetId in the config) off mainnet");
+}
+
 // Build the revenue report from the scooper report CSV. Staking rewards are
 // either what the stake withdrawals withheld (--stakingRewardsFiles, as written
 // by their --stakingRewardsOut), queried (--stakeAddresses, their current
@@ -2908,7 +2920,8 @@ export async function doPayout(argv: any) {
 
   let need = new Multiasset();
   need.addAsset("", report.payments.totalPayout + 20_000_000n);
-  need.addAsset(MAINNET_SUNDAE, BigInt(argv.yieldFarmingAmount));
+  let sundae = sundaeAssetId(argv);
+  need.addAsset(sundae, BigInt(argv.yieldFarmingAmount));
   let utxos = await collectChangeMa(provider, address, need);
 
   let options: BuildPayoutOptions = {
@@ -2922,7 +2935,7 @@ export async function doPayout(argv: any) {
     scooperPayments: payments,
     addresses: addresses,
     txLogDir: argv.txLogDir,
-    sundaeAssetId: MAINNET_SUNDAE,
+    sundaeAssetId: sundae,
     month,
   };
   await payout(options);
@@ -4157,7 +4170,7 @@ async function doSwap(argv: any) {
     queryProvider: new QueryProviderSundaeSwap(argv.mainnet ? "mainnet" : "preview"),
     walletAddress: Core.addressFromBech32(argv.walletAddress),
     preferredPools: JSON.parse(fs.readFileSync(argv.preferredPoolsFile, "utf8")),
-    asset: argv.asset ?? MAINNET_SUNDAE,
+    asset: argv.asset ?? sundaeAssetId(argv),
     amount: BigInt(argv.amount),
     approve: await cliApprover(!!argv.forceSubmit),
     ...defaultConvertAssetsTiming,
@@ -4170,6 +4183,9 @@ async function doSwap(argv: any) {
 
 if (import.meta.main) {
   let argv = minimist(process.argv.slice(2));
+  if (argv.config) {
+    argv = applyConfig(argv, readConfig(argv.config));
+  }
   if (argv.buildUpdateFeeManager) {
     await updateFeeManager(argv);
   } else if (argv.prepareUpdate) {
