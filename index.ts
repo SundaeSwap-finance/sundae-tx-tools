@@ -92,24 +92,25 @@ function valueIsZero(v: Value) {
   return coreValue.coins == 0n;
 }
 
-async function queryRewards(mainnet: boolean, stakeAddress: string): Promise<bigint | undefined> {
+// Looks up the rewards withdrawable from a stake address. A withdrawal must
+// take exactly this amount.
+export type RewardBalance = (stakeAddress: Core.RewardAccount) => Promise<bigint>;
+
+export function blockfrostRewardBalance(mainnet: boolean): RewardBalance {
   const projectId = process.env["BLOCKFROST_PROJECT_ID"];
-  let queryString = "";
-  if (mainnet) {
-    queryString = "https://cardano-mainnet.blockfrost.io/api/v0/accounts/"
-  } else {
-    queryString = "https://cardano-preview.blockfrost.io/api/v0/accounts/"
+  if (!projectId) {
+    throw new Error("Missing blockfrost key");
   }
-  queryString += stakeAddress;
-  const response = await fetch(queryString, {
-    headers: { "project_id": projectId }, 
-  });
-  try {
-    let amount = BigInt((await response.json())["withdrawable_amount"]);
-    return amount;
-  } catch (e) {
-    return undefined;
-  }
+  let network = mainnet ? "cardano-mainnet" : "cardano-preview";
+  return async (stakeAddress) => {
+    const response = await fetch(`https://${network}.blockfrost.io/api/v0/accounts/${stakeAddress}`, {
+      headers: { "project_id": projectId },
+    });
+    if (!response.ok) {
+      throw new Error(`Couldn't look up the rewards at ${stakeAddress}: ${response.status} ${await response.text()}`);
+    }
+    return BigInt((await response.json())["withdrawable_amount"]);
+  };
 }
 
 async function prompt(s: string): Promise<string> {
@@ -552,62 +553,6 @@ async function collectChangeAllowingAssets(provider: Provider, address: Core.Add
     }
   }
   throw new Error(`Couldn't find enough change: want ${amount} but only ${sum} is available from among ${change.length} eligible change utxos`);
-}
-
-async function fanout(blaze: Blaze<Provider, Wallet>, provider: Provider, wallet: Core.Address, changeUtxos: Core.TransactionUnspentOutput[], count: bigint, submit: boolean, forceSubmit: boolean, txLogDir: string): Core.TransactionUnspentOutput[] {
-  const tx = blaze.newTransaction();
-
-  let available = 0n;
-  for (let change of changeUtxos) {
-    tx.addInput(change);
-    available += change.output().amount().coin();
-  }
-  available -= 3_000_000n;
-
-  let dividend = available / count;
-
-  for (let i = 0n; i < count; i++) {
-    tx.payAssets(
-      wallet,
-      new Value(dividend)
-    );
-  }
-
-  tx.useCoinSelector((inputs, dearth) => {
-    return {
-      selectedInputs: [],
-      selectedValue: new Value(0n),
-      inputs: [],
-      leftoverInputs: [],
-    }
-  });
-
-  if (forceSubmit) {
-    let completed = await tx.complete();
-    await blaze.signTransaction(completed);
-    await blaze.submitTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    console.log("Submitted");
-    return getOutputs(completed.body());
-  } else if (submit) {
-    let completed = await tx.complete();
-    await blaze.signTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    const response = await prompt("Type 'submit' to submit");
-    if (response == "submit") {
-      await blaze.submitTransaction(completed);
-      console.log("Submitted");
-    }
-    return getOutputs(completed.body());
-  } else {
-    let completed = await tx.complete({ useCoinSelection: false });
-    if (txLogDir) {
-      let txid = completed.getId();
-      fs.writeFileSync(`${txLogDir}/${txid}-fanout.tx`, tx.toCbor());
-    }
-    console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
-    return getOutputs(completed.body());
-  }
 }
 
 function compareUtxoByAsset(asset: AssetId | null) {
@@ -2899,18 +2844,29 @@ export interface BuildPayoutOptions {
 const MAINNET_SUNDAE = "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d7753554e444145";
 
 // Build the revenue report from the scooper report CSV. Staking rewards are
-// either queried (--stakeAddresses, their current withdrawable balances) or
-// given (--totalStakingRewards).
+// either what the stake withdrawals withheld (--stakingRewardsFiles, as written
+// by their --stakingRewardsOut), queried (--stakeAddresses, their current
+// withdrawable balances) or given (--totalStakingRewards).
 async function doBuildReport(argv: any) {
   let delegated = { extraScoopers: [], delegatedScoopers: [] };
   if (argv.delegatedScoopersFile) {
     delegated = JSON.parse(fs.readFileSync(argv.delegatedScoopersFile, "utf8"));
   }
   let stakingRewards: Record<string, bigint> = {};
-  if (argv.stakeAddresses) {
+  if (argv.stakingRewardsFiles) {
+    for (let file of String(argv.stakingRewardsFiles).split(",")) {
+      for (let [stakeAddress, amount] of Object.entries(JSON.parse(fs.readFileSync(file, "utf8")))) {
+        if (stakeAddress in stakingRewards) {
+          throw new Error(`${stakeAddress} appears in more than one staking rewards file`);
+        }
+        stakingRewards[stakeAddress] = BigInt(amount as string);
+      }
+    }
+  } else if (argv.stakeAddresses) {
+    let rewardBalance = blockfrostRewardBalance(!!argv.mainnet);
     for (let stakeAddress of String(argv.stakeAddresses).split(",")) {
-      let amount = await queryRewards(!!argv.mainnet, stakeAddress);
-      if (!amount) {
+      let amount = await rewardBalance(stakeAddress as Core.RewardAccount);
+      if (amount == 0n) {
         throw new Error(`No withdrawable rewards at ${stakeAddress}; have they already been withdrawn?`);
       }
       stakingRewards[stakeAddress] = amount;
@@ -2918,7 +2874,7 @@ async function doBuildReport(argv: any) {
   } else if (argv.totalStakingRewards !== undefined) {
     stakingRewards = { total: BigInt(argv.totalStakingRewards) };
   } else {
-    throw new Error("Expected --stakeAddresses or --totalStakingRewards");
+    throw new Error("Expected --stakingRewardsFiles, --stakeAddresses or --totalStakingRewards");
   }
   let report = buildReport({
     rows: parseScooperCsv(fs.readFileSync(argv.rewardsFile, "utf8")),
@@ -2972,153 +2928,138 @@ export async function doPayout(argv: any) {
   await payout(options);
 }
 
-interface BuildWithdrawGenericStake {
-  blaze: Blaze<Provider, Wallet>,
-  change: Core.TransactionUnspentOutput,
-  stakeAddress: Address,
-  withdrawnAmount: bigint,
-  submit: boolean,
-  forceSubmit: boolean,
-  stakeKeyFile: string,
-  txLogDir: string,
+// Submits the transaction that buildTx makes and waits for it to confirm (see
+// submitAndAwaitWithRetry), or in a dry run, builds it once and prints it to be
+// signed and submitted elsewhere
+async function submitOrPrint(blaze: Blaze<Provider, Wallet>, retry: RetryOptions | undefined, anchor: TransactionInput, txLogDir: string, label: string, buildTx: () => Promise<Transaction>): Promise<Transaction> {
+  if (retry) {
+    return await submitAndAwaitWithRetry(blaze, retry, anchor, buildTx);
+  }
+  let tx = await buildTx();
+  if (txLogDir) {
+    fs.writeFileSync(`${txLogDir}/${tx.getId()}-${label}.tx`, tx.toCbor());
+  }
+  console.log(`Please sign and submit this transaction: ${envelope(tx.toCbor())}`);
+  return tx;
 }
 
-interface BuildWithdrawPoolStakeRewards {
+// The whole reward balance, which a withdrawal must take
+async function balanceToWithdraw(rewardBalance: RewardBalance, stakeAddress: Core.RewardAccount, minimum: bigint = 1n): Promise<bigint> {
+  let balance = await rewardBalance(stakeAddress);
+  if (balance == 0n) {
+    throw new Error(`No rewards to withdraw from ${stakeAddress}; have they already been withdrawn?`);
+  }
+  if (balance < minimum) {
+    throw new Error(`Only ${balance} lovelace to withdraw from ${stakeAddress}, less than the minimum of ${minimum}; leave it for next month`);
+  }
+  return balance;
+}
+
+function withdrawnBy(tx: Transaction, stakeAddress: Core.RewardAccount): bigint {
+  let withdrawn = tx.body().withdrawals()?.get(stakeAddress);
+  if (withdrawn === undefined) {
+    throw new Error(`Transaction ${tx.getId()} doesn't withdraw from ${stakeAddress}`);
+  }
+  return withdrawn;
+}
+
+export interface WithdrawStakeResult {
+  tx: Transaction,
+  // The whole balance withdrawn
+  withdrawn: bigint,
+  // What wasn't paid to the treasury, i.e. this month's staking revenue
+  withheld: bigint,
+}
+
+export interface WithdrawGenericStakeOptions {
   blaze: Blaze<Provider, Wallet>,
   provider: Provider,
-  change: Core.TransactionUnspentOutput,
-  stakeAddress: Address,
-  withdrawnAmount: bigint,
-  submit: boolean,
-  forceSubmit: boolean,
-  blueprint: Blueprint,
-  signers: string, 
-  withheldAddress: Address,
-  treasuryAddress: Address,
+  walletAddress: Address,
+  stakeAddress: Core.RewardAccount,
+  rewardBalance: RewardBalance,
+  // Signs for the stake address. Without it the transaction can only be built,
+  // for the stake key's holder to co-sign and submit.
+  stakeKey: Ed25519PrivateKey | undefined,
+  // Undefined means a dry run: build the withdrawal without submitting it
+  retry: RetryOptions | undefined,
   txLogDir: string,
 }
 
-export async function withdrawGenericStake(argv: any) {
-  let { blaze, provider } = await setupBlaze(argv);
-  let withdrawable = null;
-  if (argv.fetchRewardsAvailable) {
-    withdrawable = await queryRewards(!!argv.mainnet, argv.stakeAddress);
+// Withdraw the whole reward balance of a key stake address into the wallet
+export async function withdrawGenericStake(options: WithdrawGenericStakeOptions): Promise<WithdrawStakeResult> {
+  if (options.retry && !options.stakeKey) {
+    throw new Error("Can't submit a generic stake withdrawal without the stake key");
   }
-  let address = Core.addressFromBech32(argv.walletAddress);
-  let change = await findChange(provider, address, 1000000n);
-  let options: BuildWithdrawGenericStake = {
-    blaze: blaze,
-    change: change,
-    stakeAddress: Core.addressFromBech32(argv.stakeAddress),
-    withdrawnAmount: withdrawable || BigInt(argv.withdrawnAmount),
-    submit: argv.submit,
-    forceSubmit: argv.forceSubmit,
-    stakeKeyFile: argv.stakeKeyFile,
-    txLogDir: argv.txLogDir,
-  };
-  await buildWithdrawGenericStake(options);
+  // Fail now rather than after every retry
+  await balanceToWithdraw(options.rewardBalance, options.stakeAddress);
+  let change = await findChange(options.provider, options.walletAddress, 2_000_000n);
+
+  let tx = await submitOrPrint(options.blaze, options.retry, change.input(), options.txLogDir, "withdraw-generic-stake", async () => {
+    // Looked up on every attempt, since the balance changes each epoch
+    let withdrawn = await balanceToWithdraw(options.rewardBalance, options.stakeAddress);
+    const tx = options.blaze.newTransaction();
+    tx.addInput(change);
+    tx.addWithdrawal(options.stakeAddress, withdrawn);
+    let completed = await tx.complete({ useCoinSelection: false });
+    if (options.stakeKey) {
+      await signWithStakeKey(completed, options.stakeKey);
+    }
+    return completed;
+  });
+  let withdrawn = withdrawnBy(tx, options.stakeAddress);
+  return { tx, withdrawn, withheld: withdrawn };
 }
 
-export async function withdrawPoolStakeRewards(argv: any) {
-  let { blaze, provider } = await setupBlaze(argv);
-  let withdrawable = null;
-  if (argv.fetchRewardsAvailable) {
-    withdrawable = await queryRewards(!!argv.mainnet, argv.stakeAddress);
-  }
-  let bp = decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8"));
-  let address = Core.addressFromBech32(argv.walletAddress);
-  let change = await findChange(provider, address, 2000000n);
-  let options: BuildWithdrawPoolStakeRewards = {
-    blaze: blaze,
-    provider: provider,
-    change: change,
-    stakeAddress: Core.addressFromBech32(argv.stakeAddress),
-    withdrawnAmount: withdrawable || BigInt(argv.withdrawnAmount),
-    submit: argv.submit,
-    forceSubmit: argv.forceSubmit,
-    blueprint: bp,
-    signers: argv.signers as string,
-    withheldAddress: Core.addressFromBech32(argv.withheldAddress),
-    treasuryAddress: Core.addressFromBech32(argv.treasuryAddress), // TODO: Derive from settings datum
-    txLogDir: argv.txLogDir,
-  };
-  await buildWithdrawPoolStakeRewards(options);
-}
-
+// Adds the stake key's witness to any already on the transaction
 async function signWithStakeKey(tx: Transaction, key: Ed25519PrivateKey) {
   const sig = blazeSignMessage(HexBlob(tx.getId()), key.hex());
-  console.log("sig");
-  console.log(sig);
   const stakePublicKey = await key.toPublic();
   const stakeVkw = new VkeyWitness(stakePublicKey.hex(), sig);
-  const vkeys = [stakeVkw.toCore()];
-  let tws = new TransactionWitnessSet();
-  tws.setVkeys(CborSet.fromCore(vkeys, VkeyWitness.fromCore));
+  let tws = tx.witnessSet();
+  let vkeys = tws.vkeys()?.toCore() ?? [];
+  tws.setVkeys(CborSet.fromCore([...vkeys, stakeVkw.toCore()], VkeyWitness.fromCore));
   tx.setWitnessSet(tws);
 }
 
-async function buildWithdrawGenericStake(options: BuildWithdrawGenericStake) {
-  const tx = options.blaze.newTransaction();
+// The pool stake withdrawal pays the treasury at least this, which is also
+// the least it can withdraw
+export const POOL_STAKE_TREASURY_AMOUNT = 2_000_000n;
+// Less than this left over goes to the treasury too, rather than making an
+// output under min-ADA
+const MIN_WITHHELD_OUTPUT = 1_000_000n;
 
-  tx.addInput(options.change);
-  
-  tx.addWithdrawal(
-    options.stakeAddress.toBech32() as Core.RewardAccount,
-    options.withdrawnAmount,
-  );
-
-  let stakeKey;
-  if (options.stakeKeyFile) {
-    if (!options.submit && !options.forceSubmit) {
-      throw new Error("Must supply a stake key if submit or forceSubmit is passed");
-    }
-    let stakeKeyHex = fs.readFileSync(options.stakeKeyFile, "utf8");
-    stakeKey = Core.Ed25519PrivateKey.fromNormalHex(Ed25519PrivateNormalKeyHex(stakeKeyHex));
+// The treasury's share of a pool stake withdrawal: a flat 2 ADA, or more if
+// the settings' treasury allowance doesn't let us withhold the rest. (The
+// pool_stake validator requires at least the withdrawal less the allowance.)
+export function poolStakeTreasuryShare(withdrawn: bigint, allowance: SettingsDatum["treasuryAllowance"]): bigint {
+  let required = withdrawn - withdrawn * allowance.numerator / allowance.denominator;
+  let treasury = required > POOL_STAKE_TREASURY_AMOUNT ? required : POOL_STAKE_TREASURY_AMOUNT;
+  if (withdrawn - treasury < MIN_WITHHELD_OUTPUT) {
+    return withdrawn;
   }
-
-  if (options.forceSubmit) {
-    let completed = await tx.complete({ useCoinSelection: false });
-    await signWithStakeKey(completed, stakeKey);
-    await options.blaze.signTransaction(completed);
-    await options.blaze.submitTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    console.log("Submitted");
-    return getOutputs(completed.body())[0];
-  } else if (options.submit) {
-    let completed = await tx.complete({ useCoinSelection: false });
-    await signWithStakeKey(completed, stakeKey);
-    await options.blaze.signTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    const response = await prompt("Type 'submit' to submit");
-    if (response == "submit") {
-      await options.blaze.submitTransaction(completed);
-      console.log("Submitted");
-    }
-    return getOutputs(completed.body())[0];
-  } else {
-    let completed = await tx.complete({ useCoinSelection: false });
-    if (options.txLogDir) {
-      let txid = completed.getId();
-      fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-generic-stake.tx`, tx.toCbor());
-    }
-    console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
-    return getOutputs(completed.body())[0];
-  }
+  return treasury;
 }
 
-async function buildWithdrawPoolStakeRewards(options: BuildWithdrawPoolStakeRewards) {
-  const tx = options.blaze.newTransaction();
+export interface WithdrawPoolStakeRewardsOptions {
+  blaze: Blaze<Provider, Wallet>,
+  provider: Provider,
+  walletAddress: Address,
+  stakeAddress: Core.RewardAccount,
+  rewardBalance: RewardBalance,
+  blueprint: Blueprint,
+  signers: string,
+  withheldAddress: Address,
+  // Undefined means a dry run: build the withdrawal without submitting it
+  retry: RetryOptions | undefined,
+  txLogDir: string,
+}
 
-  tx.addInput(options.change);
-
-  let poolStakeRedeemer = HexBlob("00");
-  tx.addWithdrawal(options.stakeAddress.toBech32() as Core.RewardAccount, options.withdrawnAmount, PlutusData.fromCbor(poolStakeRedeemer));
-
-  //let withheld = 2_000_000n;
-  //let treasuryAmount = options.withdrawnAmount - withheld;
-
-  let treasuryAmount = 2_000_000n;
-  let withheld = options.withdrawnAmount - treasuryAmount;
+// Withdraw the whole reward balance of the pool stake script, paying the
+// treasury in the settings its share (see poolStakeTreasuryShare) and the rest
+// to the withheld address
+export async function withdrawPoolStakeRewards(options: WithdrawPoolStakeRewardsOptions): Promise<WithdrawStakeResult> {
+  // Fail now rather than after every retry
+  await balanceToWithdraw(options.rewardBalance, options.stakeAddress, POOL_STAKE_TREASURY_AMOUNT);
 
   const settingsAddress = new Core.Address({
     type: Core.AddressType.EnterpriseScript,
@@ -3129,83 +3070,101 @@ async function buildWithdrawPoolStakeRewards(options: BuildWithdrawPoolStakeRewa
     },
   });
   const settings = await findSettings(options.provider, settingsAddress, options.blueprint.settingsSpend.hash);
-  tx.addReferenceInput(settings);
-
   let settingsDatumCbor = settings.output().datum()?.asInlineData()?.toCbor();
   if (!settingsDatumCbor) {
     throw new Error("Couldn't get settings datum");
   }
   let settingsDatum = decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
+  let treasuryAddress = Core.Address.fromBytes(Core.HexBlob(settingsDatum.treasuryAddress.bytes(options.provider.network)));
 
-  for (let s of options.signers.split(",")) {
-    tx.addRequiredSigner(Core.Ed25519KeyHashHex(s));
-  }
+  // Spent by every attempt, and the collateral
+  let change = await findChange(options.provider, options.walletAddress, 5_000_000n);
 
-  let treasuryDatum = PlutusData.fromCbor(HexBlob("d87980"));
-
-  if (settingsDatum.treasuryAddress.paymentTag == 121n) {
-    tx.payAssets(
-      options.treasuryAddress,
-      new Value(treasuryAmount),
-      treasuryDatum,
-    );
-  } else {
-    tx.lockAssets(
-      options.treasuryAddress,
-      new Value(treasuryAmount),
-      treasuryDatum,
-    );
-  }
-
-  tx.payAssets(
-    options.withheldAddress,
-    new Value(withheld),
-  );
-
-  let poolStakeScript = Script.newPlutusV2Script(
-    new PlutusV2Script(HexBlob(options.blueprint.poolStake.validator))
-  );
-  tx.provideScript(poolStakeScript);
-
-  tx.useCoinSelector((inputs, dearth) => {
-    return {
-      selectedInputs: [],
-      selectedValue: new Value(0n),
-      inputs: [],
-      leftoverInputs: [],
+  let tx = await submitOrPrint(options.blaze, options.retry, change.input(), options.txLogDir, "withdraw-sundae-stake", async () => {
+    // Looked up on every attempt, since the balance changes each epoch
+    let withdrawn = await balanceToWithdraw(options.rewardBalance, options.stakeAddress, POOL_STAKE_TREASURY_AMOUNT);
+    const tx = options.blaze.newTransaction();
+    tx.addInput(change);
+    tx.addWithdrawal(options.stakeAddress, withdrawn, PlutusData.fromCbor(HexBlob("00")));
+    tx.addReferenceInput(settings);
+    for (let s of options.signers.split(",")) {
+      tx.addRequiredSigner(Core.Ed25519KeyHashHex(s));
     }
+
+    // The treasury output comes first, since the result reads it from there
+    let treasuryAmount = poolStakeTreasuryShare(withdrawn, settingsDatum.treasuryAllowance);
+    let treasuryDatum = PlutusData.fromCbor(HexBlob("d87980"));
+    if (settingsDatum.treasuryAddress.paymentTag == 121n) {
+      tx.payAssets(treasuryAddress, new Value(treasuryAmount), treasuryDatum);
+    } else {
+      tx.lockAssets(treasuryAddress, new Value(treasuryAmount), treasuryDatum);
+    }
+    if (withdrawn > treasuryAmount) {
+      tx.payAssets(options.withheldAddress, new Value(withdrawn - treasuryAmount));
+    }
+
+    tx.provideScript(Script.newPlutusV2Script(new PlutusV2Script(HexBlob(options.blueprint.poolStake.validator))));
+    tx.provideCollateral([change]);
+    return await tx.complete({ useCoinSelection: false });
   });
+  let withdrawn = withdrawnBy(tx, options.stakeAddress);
+  return { tx, withdrawn, withheld: withdrawn - tx.body().outputs()[0].amount().coin() };
+}
 
-  tx.provideCollateral([options.change]);
-
-  console.log(`Will complete tx: ${tx.toCbor()}`);
-
-  if (options.forceSubmit) {
-    let completed = await tx.complete({ useCoinSelection: false });
-    await options.blaze.signTransaction(completed);
-    await options.blaze.submitTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    console.log("Submitted");
-    return getOutputs(completed.body())[1];
-  } else if (options.submit) {
-    let completed = await tx.complete({ useCoinSelection: false });
-    await options.blaze.signTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    const response = await prompt("Type 'submit' to submit");
-    if (response == "submit") {
-      await options.blaze.submitTransaction(completed);
-      console.log("Submitted");
-    }
-    return getOutputs(completed.body())[1];
-  } else {
-    let completed = await tx.complete({ useCoinSelection: false });
-    if (options.txLogDir) {
-      let txid = completed.getId();
-      fs.writeFileSync(`${options.txLogDir}/${txid}-withdraw-sundae-stake.tx`, tx.toCbor());
-    }
-    console.log(`Please sign and submit this transaction: ${envelope(completed.toCbor())}`);
-    return getOutputs(completed.body())[1];
+// --withdrawnAmount, or else the current balance from Blockfrost
+function cliRewardBalance(argv: any): RewardBalance {
+  if (argv.withdrawnAmount !== undefined) {
+    let amount = BigInt(argv.withdrawnAmount);
+    return async () => amount;
   }
+  return blockfrostRewardBalance(!!argv.mainnet);
+}
+
+// Writes { stakeAddress: lovelace withheld } for --buildReport's
+// --stakingRewardsFiles
+function writeStakingRewards(path: string | undefined, stakeAddress: string, withheld: bigint) {
+  if (path) {
+    fs.writeFileSync(path, JSON.stringify({ [stakeAddress]: withheld.toString() }));
+  }
+}
+
+async function doWithdrawGenericStake(argv: any) {
+  let { blaze, provider } = await setupBlaze(argv);
+  let stakeKey = undefined;
+  if (argv.stakeKeyFile) {
+    let stakeKeyHex = fs.readFileSync(argv.stakeKeyFile, "utf8").trim();
+    stakeKey = Core.Ed25519PrivateKey.fromNormalHex(Ed25519PrivateNormalKeyHex(stakeKeyHex));
+  }
+  let { withdrawn, withheld } = await withdrawGenericStake({
+    blaze,
+    provider,
+    walletAddress: Core.addressFromBech32(argv.walletAddress),
+    stakeAddress: argv.stakeAddress,
+    rewardBalance: cliRewardBalance(argv),
+    stakeKey,
+    retry: await cliRetryOptions(argv.submit, argv.forceSubmit),
+    txLogDir: argv.txLogDir,
+  });
+  console.log(`Withdraws ${withdrawn}, of which ${withheld} is withheld from the treasury`);
+  writeStakingRewards(argv.stakingRewardsOut, argv.stakeAddress, withheld);
+}
+
+async function doWithdrawPoolStakeRewards(argv: any) {
+  let { blaze, provider } = await setupBlaze(argv);
+  let { withdrawn, withheld } = await withdrawPoolStakeRewards({
+    blaze,
+    provider,
+    walletAddress: Core.addressFromBech32(argv.walletAddress),
+    stakeAddress: argv.stakeAddress,
+    rewardBalance: cliRewardBalance(argv),
+    blueprint: decodeBlueprint(fs.readFileSync(argv.blueprint, "utf8")),
+    signers: argv.signers as string,
+    withheldAddress: Core.addressFromBech32(argv.withheldAddress),
+    retry: await cliRetryOptions(argv.submit, argv.forceSubmit),
+    txLogDir: argv.txLogDir,
+  });
+  console.log(`Withdraws ${withdrawn}, of which ${withheld} is withheld from the treasury`);
+  writeStakingRewards(argv.stakingRewardsOut, argv.stakeAddress, withheld);
 }
 
 export async function payout(options: BuildPayoutOptions): Promise<Transaction> {
@@ -3396,51 +3355,50 @@ export function withdrawalOutputs(tx: Transaction): { reward: Core.TransactionUn
   return { reward, walletOutputs };
 }
 
-export async function makeChangeUtxos(argv: any) {
-  let { blaze, provider } = await setupBlaze(argv);
-  const tx = blaze.newTransaction();
+export interface MakeChangeUtxosOptions {
+  blaze: Blaze<Provider, Wallet>,
+  provider: Provider,
+  walletAddress: Address,
+  count: bigint,
+  amount: bigint,
+  // Undefined means a dry run: build the transaction without submitting it
+  retry: RetryOptions | undefined,
+  txLogDir: string,
+}
 
-  let count = BigInt(argv.count);
-  let amount = BigInt(argv.amount);
-  let address = Core.addressFromBech32(argv.walletAddress ?? argv.address);
-  
-  let changes = await collectChangeAllowingAssets(provider, address, count * amount);
+// Collected on top of the new outputs, to pay the fee and leave the change
+// output min-ADA for any tokens it carries
+const CHANGE_MARGIN = 5_000_000n;
 
-  for (const change of changes) {
-    tx.addInput(change);
-  }
-  
-  for (let i = 0n; i < count; i++) {
-    tx.payAssets(address, new Core.Value(amount));
-  }
+// Split wallet funds into `count` ada-only outputs of `amount` each, for the
+// later steps to spend. Returns the new outputs.
+export async function makeChangeUtxos(options: MakeChangeUtxosOptions): Promise<Core.TransactionUnspentOutput[]> {
+  let inputs = await collectChangeAllowingAssets(options.provider, options.walletAddress, options.count * options.amount + CHANGE_MARGIN);
 
-  tx.useCoinSelector((inputs, dearth) => {
-    return {
-      selectedInputs: [],
-      selectedValue: new Value(0n),
-      inputs: [],
-      leftoverInputs: [],
+  let tx = await submitOrPrint(options.blaze, options.retry, inputs[0].input(), options.txLogDir, "make-change", async () => {
+    const tx = options.blaze.newTransaction();
+    for (const input of inputs) {
+      tx.addInput(input);
     }
+    for (let i = 0n; i < options.count; i++) {
+      tx.payAssets(options.walletAddress, new Core.Value(options.amount));
+    }
+    return await tx.complete({ useCoinSelection: false });
   });
-  
-  if (argv.forceSubmit) {
-    let completed = await tx.complete();
-    await blaze.signTransaction(completed);
-    await blaze.submitTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    console.log("Submitted");
-  } else if (argv.submit) {
-    let completed = await tx.complete();
-    await blaze.signTransaction(completed);
-    console.log(`${completed.toCbor()}`);
-    const response = await prompt("Type 'submit' to submit");
-    if (response == "submit") {
-      await blaze.submitTransaction(completed);
-      console.log("Submitted");
-    }
-  } else {
-    console.log(`Please sign and submit this transaction: ${tx.toCbor()}`);
-  }
+  return getOutputs(tx.body()).slice(0, Number(options.count));
+}
+
+async function doMakeChangeUtxos(argv: any) {
+  let { blaze, provider } = await setupBlaze(argv);
+  await makeChangeUtxos({
+    blaze,
+    provider,
+    walletAddress: Core.addressFromBech32(argv.walletAddress ?? argv.address),
+    count: BigInt(argv.count),
+    amount: BigInt(argv.amount),
+    retry: await cliRetryOptions(argv.submit, argv.forceSubmit),
+    txLogDir: argv.txLogDir,
+  });
 }
 
 export async function autoWithdrawRewards(options: AutoWithdrawOptions): Promise<{ change: Core.TransactionUnspentOutput[], rewards: Core.TransactionUnspentOutput[], withheld: Multiasset }> {
@@ -4242,11 +4200,11 @@ if (import.meta.main) {
   } else if (argv.doPayout) {
     await doPayout(argv);
   } else if (argv.makeChangeUtxos) {
-    await makeChangeUtxos(argv);
+    await doMakeChangeUtxos(argv);
   } else if (argv.withdrawGenericStake) {
-    await withdrawGenericStake(argv);
+    await doWithdrawGenericStake(argv);
   } else if (argv.withdrawPoolStakeRewards) {
-    await withdrawPoolStakeRewards(argv);
+    await doWithdrawPoolStakeRewards(argv);
   } else if (argv.makePayment) {
     await makePayment(argv);
   } else if (argv.payAssets) {
