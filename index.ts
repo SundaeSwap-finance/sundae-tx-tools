@@ -71,6 +71,7 @@ import {
   fromHex,
   stringify,
 } from "./util.ts";
+import { buildReport, parseScooperCsv, reportToJson } from "./report.ts";
 
 import minimist from "minimist";
 
@@ -2897,6 +2898,39 @@ export interface BuildPayoutOptions {
 
 const MAINNET_SUNDAE = "9a9693a9a37912a5097918f97918d15240c92ab729a0b7c4aa144d7753554e444145";
 
+// Build the revenue report from the scooper report CSV. Staking rewards are
+// either queried (--stakeAddresses, their current withdrawable balances) or
+// given (--totalStakingRewards).
+async function doBuildReport(argv: any) {
+  let delegated = { extraScoopers: [], delegatedScoopers: [] };
+  if (argv.delegatedScoopersFile) {
+    delegated = JSON.parse(fs.readFileSync(argv.delegatedScoopersFile, "utf8"));
+  }
+  let stakingRewards: Record<string, bigint> = {};
+  if (argv.stakeAddresses) {
+    for (let stakeAddress of String(argv.stakeAddresses).split(",")) {
+      let amount = await queryRewards(!!argv.mainnet, stakeAddress);
+      if (!amount) {
+        throw new Error(`No withdrawable rewards at ${stakeAddress}; have they already been withdrawn?`);
+      }
+      stakingRewards[stakeAddress] = amount;
+    }
+  } else if (argv.totalStakingRewards !== undefined) {
+    stakingRewards = { total: BigInt(argv.totalStakingRewards) };
+  } else {
+    throw new Error("Expected --stakeAddresses or --totalStakingRewards");
+  }
+  let report = buildReport({
+    rows: parseScooperCsv(fs.readFileSync(argv.rewardsFile, "utf8")),
+    scooperAddresses: JSON.parse(fs.readFileSync(argv.scooperAddresses, "utf8")).scoopers,
+    extraScoopers: delegated.extraScoopers,
+    delegatedScoopers: delegated.delegatedScoopers,
+    stakingRewards,
+    extraStableswapRevenue: BigInt(argv.extraStableswapRevenue ?? 0),
+  });
+  fs.writeFileSync(argv.outFile, reportToJson(report));
+}
+
 export async function doPayout(argv: any) {
   let { blaze, provider } = await setupBlaze(argv);
 
@@ -4203,6 +4237,8 @@ if (import.meta.main) {
     await Bun.write(argv.rewardsOut, withheld.toJSON());
   } else if (argv.testAutoWithdraw) {
     await testAutoWithdraw(argv);
+  } else if (argv.buildReport) {
+    await doBuildReport(argv);
   } else if (argv.doPayout) {
     await doPayout(argv);
   } else if (argv.makeChangeUtxos) {
