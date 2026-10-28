@@ -445,7 +445,12 @@ async function collectChangeSingleAsset(provider: Provider, address: Core.Addres
 // until the total value meets the supplied multiasset value. The resulting
 // change set may contain extraneous assets. Tries to optimize somewhat by
 // picking the largest available utxos for each needed asset.
-async function collectChangeMa(provider: Provider, address: Core.Address, multiasset: Multiasset): Promise<Core.TransactionUnspentOutput[]> {
+//
+// With allowOrderPayouts, utxos whose datum is an inline bytestring are also
+// collected: the payouts of our swap orders, which carry the order's
+// identifier. Only do this once no orders are waiting to settle, since
+// settleOrders finds a settled order by its payout.
+export async function collectChangeMa(provider: Provider, address: Core.Address, multiasset: Multiasset, allowOrderPayouts: boolean = false): Promise<Core.TransactionUnspentOutput[]> {
   let utxos = await provider.getUnspentOutputs(address);
   for (let utxo of utxos) {
     console.log(`${utxo.input().transactionId()}`);
@@ -481,8 +486,9 @@ async function collectChangeMa(provider: Provider, address: Core.Address, multia
       if (utxo.output().scriptRef()) {
         continue;
       }
-      // Skip utxos with datums
-      if (utxo.output().datum()) {
+      // Skip utxos with datums, except order payouts if they're allowed
+      let datum = utxo.output().datum();
+      if (datum && !(allowOrderPayouts && datum.asInlineData()?.asBoundedBytes())) {
         continue;
       }
 
@@ -558,8 +564,8 @@ async function collectChangeAllowingAssets(provider: Provider, address: Core.Add
 
 function compareUtxoByAsset(asset: AssetId | null) {
   return function(a: Core.TransactionUnspentOutput, b: Core.TransactionUnspentOutput): number {
-    let amountA = asset ? a.output().amount().multiasset().get(asset) : a.output().amount().coin();
-    let amountB = asset ? b.output().amount().multiasset().get(asset) : b.output().amount().coin();
+    let amountA = asset ? a.output().amount().multiasset()?.get(asset) ?? 0n : a.output().amount().coin();
+    let amountB = asset ? b.output().amount().multiasset()?.get(asset) ?? 0n : b.output().amount().coin();
     if (amountA > amountB) {
       return -1;
     } else if (amountA < amountB ){
@@ -2364,7 +2370,7 @@ async function queryStablePools(provider: Provider, poolAddress: string): Promis
 }
 
 
-interface RetryOptions {
+export interface RetryOptions {
   // Decides whether a signed transaction should be submitted. Returning false
   // aborts the whole run.
   approve: (tx: Transaction) => Promise<boolean>,
@@ -2373,7 +2379,7 @@ interface RetryOptions {
   confirmationTimeoutMs: number,
 }
 
-const defaultRetryOptions = {
+export const defaultRetryOptions = {
   maxAttempts: 10,
   retryDelayMs: 20_000,
   confirmationTimeoutMs: 120_000,
@@ -2381,7 +2387,7 @@ const defaultRetryOptions = {
 
 // Approves every transaction after a single confirmation up front
 // (--forceSubmit), or asks about each transaction individually (--submit).
-async function cliApprover(forceSubmit: boolean): Promise<(tx: Transaction) => Promise<boolean>> {
+export async function cliApprover(forceSubmit: boolean): Promise<(tx: Transaction) => Promise<boolean>> {
   if (forceSubmit) {
     const response = await prompt("Do you really want to force submission of all transactions? (yes/no)");
     if (response != "yes") {
@@ -2616,7 +2622,7 @@ interface AutoWithdrawOptions {
 
 // A references file is a JSON list of { txHash, index } pointing at the utxos
 // that hold the reference scripts
-function readReferences(path: string): TransactionInput[] {
+export function readReferences(path: string): TransactionInput[] {
   let referenceRefs = [];
   for (let utxoRef of JSON.parse(fs.readFileSync(path, "utf8"))) {
     referenceRefs.push(
@@ -2918,11 +2924,9 @@ export async function doPayout(argv: any) {
   }
   console.log(`Paying out revenue for ${month}`);
 
-  let need = new Multiasset();
-  need.addAsset("", report.payments.totalPayout + 20_000_000n);
   let sundae = sundaeAssetId(argv);
-  need.addAsset(sundae, BigInt(argv.yieldFarmingAmount));
-  let utxos = await collectChangeMa(provider, address, need);
+  // The SUNDAE bought for yield farming is in the payout of its swap order
+  let utxos = await collectChangeMa(provider, address, payoutChangeNeeded(report, sundae, BigInt(argv.yieldFarmingAmount)), true);
 
   let options: BuildPayoutOptions = {
     blaze: blaze,
@@ -3180,6 +3184,19 @@ async function doWithdrawPoolStakeRewards(argv: any) {
   writeStakingRewards(argv.stakingRewardsOut, argv.stakeAddress, withheld);
 }
 
+// The yield farming payment is SUNDAE, with this much ada
+const YIELD_FARMING_ADA = 2_000_000n;
+
+// What the payout spends: every payment in ada except yield farming, whose ada
+// was already spent on the SUNDAE it pays instead, plus a margin for the fee
+// and change
+export function payoutChangeNeeded(report: Report, sundaeAssetId: string, yieldFarmingAmount: bigint): Multiasset {
+  let need = new Multiasset();
+  need.addAsset("", report.payments.totalPayout - report.payments.yieldFarming + YIELD_FARMING_ADA + 20_000_000n);
+  need.addAsset(sundaeAssetId, yieldFarmingAmount);
+  return need;
+}
+
 export async function payout(options: BuildPayoutOptions): Promise<Transaction> {
   const tx = options.blaze.newTransaction();
 
@@ -3195,7 +3212,7 @@ export async function payout(options: BuildPayoutOptions): Promise<Transaction> 
     new Core.Value(options.report.payments.tokenHoldersFee),
   );
   let yieldFarmingSundaeValue = new Multiasset();
-  yieldFarmingSundaeValue.addAsset("", 2_000_000);
+  yieldFarmingSundaeValue.addAsset("", YIELD_FARMING_ADA);
   yieldFarmingSundaeValue.addAsset(options.sundaeAssetId, options.yieldFarmingAmount);
   tx.payAssets(
     options.yieldFarmingDestination,
@@ -3938,7 +3955,7 @@ async function buildAssetSwaps(blaze, provider, wallet, queryProvider, preferred
 }
 
 // The parts of the SundaeSwap query provider that converting assets needs
-interface SwapQueryProvider {
+export interface SwapQueryProvider {
   findPoolDataByIdent(query: { ident: string }): Promise<PoolData>,
   getProtocolParamsWithScripts(version: EContractVersion): Promise<{ blueprint: { validators: { title: string, hash: string }[] } }>,
 }

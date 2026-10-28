@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import * as crypto from "node:crypto";
-import { Hash28ByteBase16, HexBlob, NetworkId, PlutusData, Transaction } from "@blaze-cardano/core";
+import { Hash28ByteBase16, HexBlob, NetworkId, Transaction } from "@blaze-cardano/core";
 import { Core } from "@blaze-cardano/sdk";
 import {
   POOL_STAKE_TREASURY_AMOUNT,
@@ -9,9 +9,7 @@ import {
   withdrawPoolStakeRewards,
   type RewardBalance,
 } from "./index.ts";
-import { decodeSettingsDatum, decoder, encodeSettingsDatum, withEncoderHex } from "./codec.ts";
-import { fromHex } from "./util.ts";
-import { STABLE_TOKEN, blueprint, makeWorld, type World } from "./testFixtures.ts";
+import { STABLE_TOKEN, setTreasuryAllowance, blueprint, makeWorld, type World } from "./testFixtures.ts";
 
 // These tests run the change, generic stake and pool stake steps against an
 // emulated ledger. The emulator checks that a withdrawal takes exactly the
@@ -177,18 +175,6 @@ describe("withdrawGenericStake", () => {
   });
 });
 
-// Replace the settings with ones that let the treasury admin withhold the
-// given fraction of a pool stake withdrawal
-function setTreasuryAllowance(world: World, numerator: bigint, denominator: bigint) {
-  let settings = world.emulator.utxos().find((u) => u.output().address().getProps().paymentPart?.hash == blueprint.settingsSpend.hash)!;
-  let datum = decodeSettingsDatum(decoder(fromHex(settings.output().datum()!.asInlineData()!.toCbor())));
-  datum.treasuryAllowance = { numerator, denominator };
-  let output = new Core.TransactionOutput(settings.output().address(), settings.output().amount());
-  output.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(withEncoderHex(encodeSettingsDatum, datum)))));
-  world.emulator.removeUtxo(settings.input());
-  world.emulator.addUtxo(new Core.TransactionUnspentOutput(settings.input(), output));
-}
-
 describe("withdrawPoolStakeRewards", () => {
   let world: World;
   let stakeAddress: Core.RewardAccount;
@@ -197,7 +183,7 @@ describe("withdrawPoolStakeRewards", () => {
   beforeEach(async () => {
     world = await makeWorld();
     // As on mainnet, the treasury admin may withhold everything
-    setTreasuryAllowance(world, 1n, 1n);
+    setTreasuryAllowance(world.emulator, 1n, 1n);
     stakeAddress = Core.RewardAccount.fromCredential({ type: Core.CredentialType.ScriptHash, hash: Hash28ByteBase16(blueprint.poolStake.hash) }, NetworkId.Testnet);
     world.emulator.accounts.set(stakeAddress, 100_000_000n);
     withheldAddress = randomAddress();
@@ -239,7 +225,7 @@ describe("withdrawPoolStakeRewards", () => {
 
   it("pays the treasury more when the allowance requires it", async () => {
     // The fixture's original settings: withhold at most 1/10
-    setTreasuryAllowance(world, 1n, 10n);
+    setTreasuryAllowance(world.emulator, 1n, 10n);
     let { tx, withheld } = await run();
 
     expect(withheld).toBe(10_000_000n);

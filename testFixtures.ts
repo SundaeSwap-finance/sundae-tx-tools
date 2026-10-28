@@ -239,6 +239,21 @@ export function withMapExtensions(settings: TransactionUnspentOutput): Transacti
   return new TransactionUnspentOutput(settings.input(), output);
 }
 
+// Replace the settings with ones that let the treasury admin withhold the
+// given fraction of a withdrawal
+export function setTreasuryAllowance(emulator: Emulator, numerator: bigint, denominator: bigint) {
+  let settings = emulator.utxos().find((u) => u.output().address().getProps().paymentPart?.hash == blueprint.settingsSpend.hash)!;
+  let datum = decodeSettingsDatum(decoder(fromHex(settings.output().datum()!.asInlineData()!.toCbor())));
+  datum.treasuryAllowance = { numerator, denominator };
+  // The decoder skips the extensions, which the fixture settings always have
+  // as the empty map (see withMapExtensions)
+  datum.extensions = Buffer.from([0xa0]);
+  let output = new TransactionOutput(settings.output().address(), settings.output().amount());
+  output.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(withEncoderHex(encodeSettingsDatum, datum)))));
+  emulator.removeUtxo(settings.input());
+  emulator.addUtxo(new TransactionUnspentOutput(settings.input(), output));
+}
+
 export async function makeWorld(kind: "v3" | "stable" = "v3", stableFees = STABLE_FEES): Promise<World> {
   await Core.initCrypto();
   let skey = Core.Ed25519PrivateKey.fromNormalBytes(crypto.randomBytes(32));
