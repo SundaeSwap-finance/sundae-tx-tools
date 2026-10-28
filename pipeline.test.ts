@@ -295,3 +295,64 @@ describe("the monthly revenue run", () => {
     await expect(runStage1(month.ctx, "2026-11")).rejects.toThrow(/for 2026-10, not 2026-11/);
   });
 });
+
+// Approves every transaction except the one at the given position, and keeps
+// track of what it approved
+function auditedApprover(declineAt = Infinity) {
+  let audit = {
+    calls: 0,
+    approved: new Set<string>(),
+    declined: undefined as string | undefined,
+    approve: async (tx: Transaction) => {
+      if (audit.calls++ == declineAt) {
+        audit.declined = tx.getId();
+        return false;
+      }
+      audit.approved.add(tx.getId());
+      return true;
+    },
+  };
+  return audit;
+}
+
+// Submissions other than the co-signer's
+function pipelineSubmissions(month: Month): string[] {
+  let generic = month.record()?.genericStakeWithdrawal?.txId;
+  return month.provider.submissions.map((tx) => tx.getId()).filter((id) => id != generic);
+}
+
+describe("approval", () => {
+  it("is given for every transaction the run submits", async () => {
+    let month = await makeMonth();
+    let audit = auditedApprover();
+    month.ctx.retry.approve = audit.approve;
+    await runMonth(month);
+
+    let submitted = pipelineSubmissions(month);
+    expect(submitted.length).toBeGreaterThan(0);
+    expect(submitted.filter((id) => !audit.approved.has(id))).toEqual([]);
+  });
+
+  it("when withheld, stops the run before that transaction or any later one is submitted", async () => {
+    // How many transactions a whole run asks to approve
+    let full = await makeMonth();
+    let fullAudit = auditedApprover();
+    full.ctx.retry.approve = fullAudit.approve;
+    await runMonth(full);
+    // Each step asks at least once
+    expect(fullAudit.calls).toBeGreaterThanOrEqual(7);
+
+    for (let declineAt = 0; declineAt < fullAudit.calls; declineAt++) {
+      let month = await makeMonth();
+      let audit = auditedApprover(declineAt);
+      month.ctx.retry.approve = audit.approve;
+      await expect(runMonth(month)).rejects.toThrow(/Aborted/);
+
+      // Only what was approved before the declined transaction went out
+      expect(audit.declined).toBeDefined();
+      expect(pipelineSubmissions(month)).toEqual([...audit.approved]);
+      expect(audit.calls).toBe(declineAt + 1);
+    }
+  // A whole run per approval
+  }, 120_000);
+});
