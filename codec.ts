@@ -1,11 +1,12 @@
 import {
   NetworkId,
+  AssetId,
 } from "@blaze-cardano/core";
 
 import {
   fromHex,
   stringify,
-} from "./util.js";
+} from "./util.ts";
 
 class Decoder {
   public bytes: Buffer;
@@ -337,12 +338,12 @@ export function decodeSettingsDatum(d: Decoder): SettingsDatum {
   let simpleFee = decodeInteger(d);
   let strategyFee = decodeInteger(d);
   let poolCreationFee = decodeInteger(d);
-  // We don't care about the extensions; we could just skip it but it's actually
-  // kind of annoying to implement a "skip the next CBOR item" function to
-  // handle the extensions. Fortunately we can just return immediately since
-  // this is the last item in the datum
-  //let extensions = decodeData(d);
-  //decodeBreak(d);
+  // Rather than decode the extensions, keep their raw CBOR, so a datum
+  // re-encodes unchanged. They're the last item, so they run up to the break
+  // that ends the datum's (indefinite) field list.
+  let extensions = d.bytes.length > d.ptr && d.bytes[d.bytes.length - 1] == 0xff
+    ? d.bytes.subarray(d.ptr, d.bytes.length - 1)
+    : undefined;
   return {
     settingsAdmin,
     metadataAdmin,
@@ -355,7 +356,7 @@ export function decodeSettingsDatum(d: Decoder): SettingsDatum {
     simpleFee,
     strategyFee,
     poolCreationFee,
-    //extensions,
+    extensions,
   };
 }
 
@@ -944,6 +945,15 @@ export function encodeConvenienceFeeManagerRedeemer(e: Encoder, convenienceFeeMa
 
 export type AssetClass = [Buffer, Buffer]
 
+export function assetClassIsAda(a: AssetClass) {
+  return a[0].length == 0 && a[1].length == 0;
+}
+
+export function assetClassToAssetId(a: AssetClass) {
+  let assetId = AssetId(`${a[0].toString('hex')}.${a[1].toString('hex')}`);
+  return assetId;
+}
+
 export type AssetPair = [AssetClass, AssetClass]
 
 function encodeAssetClass(e: Encoder, assetClass: AssetClass) {
@@ -1052,6 +1062,8 @@ export interface SettingsDatum {
   simpleFee: bigint,
   strategyFee: bigint,
   poolCreationFee: bigint,
+  // Raw CBOR of the extensions field. When absent, encodes as Void (d87980).
+  extensions?: Buffer,
 }
 
 export function encodeSettingsDatum(e: Encoder, settingsDatum: SettingsDatum) {
@@ -1068,8 +1080,12 @@ export function encodeSettingsDatum(e: Encoder, settingsDatum: SettingsDatum) {
   encodeInteger(e, settingsDatum.simpleFee);
   encodeInteger(e, settingsDatum.strategyFee);
   encodeInteger(e, settingsDatum.poolCreationFee);
-  encodeTag8(e, 121n);
-  encodeEmptyArray(e);
+  if (settingsDatum.extensions) {
+    e.writeBytes(settingsDatum.extensions);
+  } else {
+    encodeTag8(e, 121n);
+    encodeEmptyArray(e);
+  }
   encodeBreak(e);
 }
 
@@ -1078,4 +1094,158 @@ function testDecodePoolDatum() {
   let epdHex = "d8799f581cba228444515fbefd2c8725338e49589f206c7f18a33e002b157aac3c9f9f4040ff9f581c99b071ce8580d6a3a11b4902145adb8bfd0d2a03935af8cf66403e1546534245525259ffff1a01c9c380181e181ed8799fd87f9f581ce8dc0595c8d3a7e2c0323a11f5519c32d3b3fb7a994519e38b698b5dffff001a002dc6c0ff";
   let epd = decoder(fromHex(epdHex));
   console.log(`decoded example pool datum: ${stringify(decodePoolDatum(epd))}`);
+}
+
+// ---- Stable pool datum ----
+
+export interface StablePoolDatum {
+  identifier: Buffer,
+  assetPair: [AssetClass, AssetClass],
+  circulatingLp: bigint,
+  lpFeeBasisPoints: [bigint, bigint],
+  protocolFeeBasisPoints: [bigint, bigint],
+  feeManager: Multisig | null,
+  marketOpen: bigint,
+  protocolFees: [bigint, bigint, bigint],
+  linearAmplification: bigint,
+  sumInvariant: bigint,
+  linearAmplificationManager: Multisig | null,
+}
+
+function decodeBignum(d: Decoder): bigint {
+  let tag = d.readUInt8();
+  if (tag == 0xc2n) {
+    let bytes = decodeByteArray(d);
+    let result = 0n;
+    for (let i = 0; i < bytes.length; i++) {
+      result = result * 256n + BigInt(bytes[i]);
+    }
+    return result;
+  } else {
+    throw new Error("decodeBignum: unexpected tag: 0x" + tag.toString(16));
+  }
+}
+
+function decodeIntPair(d: Decoder): [bigint, bigint] {
+  decodeBeginIndefiniteArray(d);
+  let a = decodeInteger(d);
+  let b = decodeInteger(d);
+  decodeBreak(d);
+  return [a, b];
+}
+
+function decodeIntTriple(d: Decoder): [bigint, bigint, bigint] {
+  decodeBeginIndefiniteArray(d);
+  let a = decodeInteger(d);
+  let b = decodeInteger(d);
+  let c = decodeInteger(d);
+  decodeBreak(d);
+  return [a, b, c];
+}
+
+export function decodeStablePoolDatum(d: Decoder): StablePoolDatum {
+  let _ = decodeTag(d);
+  decodeBeginIndefiniteArray(d);
+  let identifier = decodeByteArray(d);
+  let assetPair = decodeAssetPair(d);
+  let circulatingLp = decodeInteger(d);
+  let lpFeeBasisPoints = decodeIntPair(d);
+  let protocolFeeBasisPoints = decodeIntPair(d);
+  let feeManager = decodeOptionalMultisig(d);
+  let marketOpen = decodeInteger(d);
+  let protocolFees = decodeIntTriple(d);
+  let linearAmplification = decodeInteger(d);
+  let sumInvariant = decodeBignum(d);
+  let linearAmplificationManager = decodeOptionalMultisig(d);
+  decodeBreak(d);
+  return {
+    identifier,
+    assetPair,
+    circulatingLp,
+    lpFeeBasisPoints,
+    protocolFeeBasisPoints,
+    feeManager,
+    marketOpen,
+    protocolFees,
+    linearAmplification,
+    sumInvariant,
+    linearAmplificationManager,
+  };
+}
+
+function encodeBignum(e: Encoder, n: bigint) {
+  let hex = n.toString(16);
+  if (hex.length % 2 === 1) hex = '0' + hex;
+  let bytes = Buffer.from(hex, 'hex');
+  e.writeUInt8(0xc2n);
+  encodeByteArray(e, bytes);
+}
+
+export function encodeStablePoolDatum(e: Encoder, datum: any) {
+  encodeTag8(e, 121n);
+  encodeBeginArrayIndefinite(e);
+  encodeByteArray(e, datum.identifier);
+  encodeAssetPair(e, datum.assetPair);
+  encodeInteger(e, datum.circulatingLp);
+  encodeBeginArrayIndefinite(e);
+  encodeInteger(e, datum.lpFeeBasisPoints[0]);
+  encodeInteger(e, datum.lpFeeBasisPoints[1]);
+  encodeBreak(e);
+  encodeBeginArrayIndefinite(e);
+  encodeInteger(e, datum.protocolFeeBasisPoints[0]);
+  encodeInteger(e, datum.protocolFeeBasisPoints[1]);
+  encodeBreak(e);
+  if (!datum.feeManager) {
+    encodeTag8(e, 122n);
+    encodeEmptyArray(e);
+  } else {
+    encodeTag8(e, 121n);
+    encodeBeginArrayIndefinite(e);
+    encodeMultisig(e, datum.feeManager);
+    encodeBreak(e);
+  }
+  encodeInteger(e, datum.marketOpen);
+  encodeBeginArrayIndefinite(e);
+  encodeInteger(e, datum.protocolFees[0]);
+  encodeInteger(e, datum.protocolFees[1]);
+  encodeInteger(e, datum.protocolFees[2]);
+  encodeBreak(e);
+  encodeInteger(e, datum.linearAmplification);
+  encodeBignum(e, datum.sumInvariant);
+  if (!datum.linearAmplificationManager) {
+    encodeTag8(e, 122n);
+    encodeEmptyArray(e);
+  } else {
+    encodeTag8(e, 121n);
+    encodeBeginArrayIndefinite(e);
+    encodeMultisig(e, datum.linearAmplificationManager);
+    encodeBreak(e);
+  }
+  encodeBreak(e);
+}
+
+export function encodeStablePoolManageRedeemer(e: Encoder, redeemer: any) {
+  if (redeemer.tag == "WithdrawFees") {
+    encodeTag8(e, 121n);
+    encodeBeginArrayIndefinite(e);
+    encodeBeginArrayIndefinite(e);
+    encodeInteger(e, redeemer.amount[0]);
+    encodeInteger(e, redeemer.amount[1]);
+    encodeInteger(e, redeemer.amount[2]);
+    encodeBreak(e);
+    encodeInteger(e, redeemer.treasuryOutput);
+    encodeInteger(e, redeemer.poolInput);
+    encodeBreak(e);
+  } else {
+    throw new Error("Invalid stable pool manage redeemer: " + JSON.stringify(redeemer));
+  }
+}
+
+export function encodeStablePoolSpendRedeemer(e: Encoder, redeemer: any) {
+  if (redeemer.tag == "Manage") {
+    encodeTag8(e, 122n);
+    encodeEmptyArray(e);
+  } else {
+    throw new Error("Invalid stable pool spend redeemer: " + JSON.stringify(redeemer));
+  }
 }
