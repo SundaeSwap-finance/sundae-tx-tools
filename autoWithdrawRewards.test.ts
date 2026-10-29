@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { Transaction, TransactionUnspentOutput } from "@blaze-cardano/core";
-import { submitAndAwaitWithRetry } from "./index.ts";
+import { makeChangeUtxos, stableWithdrawalTokens, submitAndAwaitWithRetry } from "./index.ts";
 import { decodePoolDatum, decodeStablePoolDatum, decoder } from "./codec.ts";
 import { fromHex } from "./util.ts";
 import {
   SCOOP_FEE,
   STABLE_FEES,
   STABLE_TOKEN,
+  inflatePoolFees,
   makeWorld,
   runAutoWithdraw,
   type World,
@@ -45,6 +46,10 @@ function withdrawnPerPool(world: World, scoopsPerPool: Map<string, number> = new
     withdrawn.set(ident, world.initialFees.get(ident)! + added - fees);
   }
   return withdrawn;
+}
+
+function firstPool(world: World): TransactionUnspentOutput {
+  return world.emulator.utxos().find((u) => u.output().address().toBytes() == world.poolAddress.toBytes())!;
 }
 
 function sum(values: Iterable<bigint>): bigint {
@@ -156,6 +161,19 @@ describe("autoWithdrawRewards", () => {
     expect(world.provider.submissions.length).toBe(0);
   });
 
+  it("skips a pool whose datum claims more fees than it holds", async () => {
+    let broken = inflatePoolFees(world.emulator, firstPool(world), false);
+    let brokenFees = currentFees(world).get(broken);
+    await runAutoWithdraw(world, 30_000_000n);
+
+    // The other two pools give 17 + 13 ADA
+    expect(currentFees(world).get(broken)).toBe(brokenFees);
+    expect(world.provider.submissions.length).toBe(2);
+    let withdrawn = withdrawnPerPool(world);
+    withdrawn.delete(broken);
+    expect(sum(withdrawn.values())).toBe(30_000_000n);
+  });
+
   it("reports no rewards when the whole withdrawal goes to the treasury", async () => {
     // The treasury takes at least 1 ADA, so nothing is withheld
     let { rewards, change, withheld } = await runAutoWithdraw(world, 1_000_000n);
@@ -241,6 +259,27 @@ describe("autoWithdrawRewards on stable pools", () => {
     expectRewards(rewards);
   });
 
+  it("skips a pool whose datum claims more fees than it holds", async () => {
+    let broken = inflatePoolFees(world.emulator, firstPool(world), true);
+    let brokenFees = currentStableFees(world).get(broken);
+    await runAutoWithdraw(world, 0n, { stable: true });
+
+    expect(world.provider.submissions.length).toBe(1);
+    expect(currentStableFees(world).get(broken)).toEqual(brokenFees);
+  });
+
+  it("leaves the pools the config skips alone", async () => {
+    let idents = [...currentStableFees(world).keys()];
+    let skippedFees = currentStableFees(world).get(idents[0]);
+    expect(await stableWithdrawalTokens(world.provider, world.poolAddress.toBech32(), [idents[0]])).toEqual([STABLE_TOKEN]);
+    expect(await stableWithdrawalTokens(world.provider, world.poolAddress.toBech32(), idents)).toEqual([]);
+
+    await runAutoWithdraw(world, 0n, { stable: true, skipPools: [idents[0]] });
+    expect(world.provider.submissions.length).toBe(1);
+    expect(currentStableFees(world).get(idents[0])).toEqual(skippedFees);
+    expect(currentStableFees(world).get(idents[1])).toEqual([3_000_000n, 0n, 0n]);
+  });
+
   it("retries a withdrawal whose pool was scooped first", async () => {
     world.provider.script = ["scoopFirst"];
     world.provider.staleReadsAfterScoop = 1;
@@ -280,5 +319,44 @@ describe("submitAndAwaitWithRetry", () => {
     await expect(submitAndAwaitWithRetry(world.blaze, retry, change[0].input(), buildTx)).rejects.toThrow(/doesn't spend the anchor input/);
     // Only the first, dropped attempt was submitted
     expect(world.provider.submissions.length).toBe(1);
+  });
+});
+
+// The run's funds in one wallet and the treasury admin's key in another, as
+// on preview, where the admin's address holds a reference script the run
+// mustn't spend
+describe("with a separate treasury admin", () => {
+  function vkeyCount(tx: Transaction): number {
+    return tx.witnessSet().vkeys()?.size() ?? 0;
+  }
+
+  it("signs the v3 withdrawals as both the wallet and the admin", async () => {
+    let world = await makeWorld("v3", STABLE_FEES, { separateAdmin: true });
+    await runAutoWithdraw(world, NEEDED);
+
+    expect(world.provider.submissions.length).toBe(3);
+    expect(world.provider.submissions.map(vkeyCount)).toEqual([2, 2, 2]);
+  });
+
+  it("signs the stable withdrawals as both the wallet and the admin", async () => {
+    let world = await makeWorld("stable", STABLE_FEES, { separateAdmin: true });
+    await runAutoWithdraw(world, 0n, { stable: true });
+
+    expect(world.provider.submissions.length).toBe(2);
+    expect(world.provider.submissions.map(vkeyCount)).toEqual([2, 2]);
+  });
+
+  it("leaves the admin's signature off transactions that don't need it", async () => {
+    let world = await makeWorld("v3", STABLE_FEES, { separateAdmin: true });
+    await makeChangeUtxos({
+      blaze: world.blaze,
+      provider: world.provider,
+      walletAddress: world.wallet,
+      count: 2n,
+      amount: 10_000_000n,
+      retry: { approve: async () => true, maxAttempts: 1, retryDelayMs: 0, confirmationTimeoutMs: 0 },
+      txLogDir: "",
+    });
+    expect(world.provider.submissions.map(vkeyCount)).toEqual([1]);
   });
 });

@@ -22,6 +22,7 @@ import {
   decodeBlueprint,
   makeChange,
   makeRandomPool,
+  AdminSigningWallet,
   makeScriptRef,
   makeSettings,
   type Blueprint,
@@ -72,6 +73,24 @@ export function scoopStablePool(output: TransactionOutput): TransactionOutput {
   let scooped = new TransactionOutput(output.address(), value);
   scooped.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(withEncoderHex(encodeStablePoolDatum, datum)))));
   return scooped;
+}
+
+// Replaces a pool on the ledger with one whose datum claims more fees than the
+// pool holds, as anyone can create on preview. Returns the pool's ident.
+export function inflatePoolFees(emulator: Emulator, pool: TransactionUnspentOutput, stable: boolean): string {
+  let output = pool.output();
+  let cbor = output.datum()!.asInlineData()!.toCbor();
+  let datum = stable ? decodeStablePoolDatum(decoder(fromHex(cbor))) : decodePoolDatum(decoder(fromHex(cbor)));
+  if (stable) {
+    (datum as any).protocolFees[2] = output.amount().multiasset()!.get(STABLE_TOKEN)! + 1n;
+  } else {
+    (datum as any).protocolFees = output.amount().coin() + 1n;
+  }
+  let inflated = new TransactionOutput(output.address(), output.amount());
+  inflated.setDatum(Core.Datum.newInlineData(PlutusData.fromCbor(HexBlob(withEncoderHex(stable ? encodeStablePoolDatum : encodePoolDatum, datum)))));
+  emulator.removeUtxo(pool.input());
+  emulator.addUtxo(new TransactionUnspentOutput(pool.input(), inflated));
+  return datum.identifier.toString("hex");
 }
 
 // An emulator provider whose submissions can be scripted to misbehave. Every
@@ -254,11 +273,14 @@ export function setTreasuryAllowance(emulator: Emulator, numerator: bigint, deno
   emulator.addUtxo(new TransactionUnspentOutput(settings.input(), output));
 }
 
-export async function makeWorld(kind: "v3" | "stable" = "v3", stableFees = STABLE_FEES): Promise<World> {
+// With separateAdmin, the treasury admin (who must sign withdrawals, and whose
+// key the pools delegate to) isn't the wallet that funds the run
+export async function makeWorld(kind: "v3" | "stable" = "v3", stableFees = STABLE_FEES, options: { separateAdmin?: boolean } = {}): Promise<World> {
   await Core.initCrypto();
   let skey = Core.Ed25519PrivateKey.fromNormalBytes(crypto.randomBytes(32));
-  let pkh = await (await skey.toPublic()).hash();
-  let wallet = Core.Address.fromBytes(HexBlob("60" + pkh.hex()));
+  let wallet = Core.Address.fromBytes(HexBlob("60" + (await (await skey.toPublic()).hash()).hex()));
+  let adminKey = options.separateAdmin ? Core.Ed25519PrivateKey.fromNormalBytes(crypto.randomBytes(32)) : skey;
+  let pkh = await (await adminKey.toPublic()).hash();
 
   let emulator = new Emulator([]);
   for (let i = 0; i < 5; i++) {
@@ -306,7 +328,8 @@ export async function makeWorld(kind: "v3" | "stable" = "v3", stableFees = STABL
   emulator.accounts.set(poolManageAccount, 0n);
 
   let provider = new ContentionProvider(emulator, poolBlueprint.poolSpend.hash, kind == "v3" ? scoopV3Pool : scoopStablePool);
-  let blaze = await Blaze.from(provider, new HotSingleWallet(Ed25519PrivateNormalKeyHex(skey.hex()), NetworkId.Testnet, provider));
+  let funding = new HotSingleWallet(Ed25519PrivateNormalKeyHex(skey.hex()), NetworkId.Testnet, provider);
+  let blaze = await Blaze.from(provider, options.separateAdmin ? await AdminSigningWallet.create(funding, adminKey) : funding);
 
   return {
     emulator,
@@ -320,7 +343,7 @@ export async function makeWorld(kind: "v3" | "stable" = "v3", stableFees = STABL
   };
 }
 
-export function runAutoWithdraw(world: World, needed: bigint, overrides: { approve?: (tx: Transaction) => Promise<boolean>, maxAttempts?: number, stable?: boolean } = {}) {
+export function runAutoWithdraw(world: World, needed: bigint, overrides: { approve?: (tx: Transaction) => Promise<boolean>, maxAttempts?: number, stable?: boolean, skipPools?: string[] } = {}) {
   return autoWithdrawRewards({
     poolAddress: world.poolAddress.toBech32(),
     needed,
@@ -341,6 +364,7 @@ export function runAutoWithdraw(world: World, needed: bigint, overrides: { appro
     txLogDir: "",
     todo: undefined,
     stable: overrides.stable ?? false,
+    skipPools: overrides.skipPools ?? [],
   });
 }
 

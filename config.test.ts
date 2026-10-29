@@ -82,6 +82,14 @@ describe("applyConfig", () => {
   });
 });
 
+describe("skipPools", () => {
+  it("gives the withdrawal the pools to skip for its protocol", () => {
+    let config = readConfig(writeConfig({ network: "preview", v3: { skipPools: ["aa"] }, stable: { skipPools: ["bb", "cc"] } }));
+    expect(applyConfig({ autoWithdrawRewards: true, stable: true }, config).skipPools).toEqual(["bb", "cc"]);
+    expect(applyConfig({ autoWithdrawRewards: true }, config).skipPools).toEqual(["aa"]);
+  });
+});
+
 describe("readConfig", () => {
   it("resolves paths against the config file's directory", () => {
     let file = writeConfig({ network: "preview", v3: { blueprint: "bp.json" }, stable: { references: "refs" } });
@@ -102,6 +110,7 @@ describe("readConfig", () => {
 
 describe("sundaeAssetId", () => {
   it("has no default off mainnet", () => {
-    expect(() => sundaeAssetId(applyConfig({}, preview))).toThrow(/sundaeAssetId/);
+    let bare = readConfig(writeConfig({ network: "preview" }));
+    expect(() => sundaeAssetId(applyConfig({}, bare))).toThrow(/sundaeAssetId/);
   });
 });

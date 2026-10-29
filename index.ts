@@ -54,6 +54,7 @@ import {
   encodeStablePoolManageRedeemer,
   encodeStablePoolSpendRedeemer,
   assetClassIsAda,
+  type AssetClass,
   assetClassToAssetId,
   newAddress,
   MultisigSignature,
@@ -150,6 +151,25 @@ async function findSettings(provider: Provider, settingsAddress: Address, settin
     }
   }
   throw new Error("findSettings: Couldn't find a UTxO with the settings NFT at the settings address.");
+}
+
+// The protocol settings, from the v3 blueprint's settings script (the stable
+// pools share them)
+export async function readSettingsDatum(provider: Provider, blueprint: Blueprint): Promise<SettingsDatum> {
+  const settingsAddress = new Core.Address({
+    type: Core.AddressType.EnterpriseScript,
+    networkId: provider.network,
+    paymentPart: {
+      type: Core.CredentialType.ScriptHash,
+      hash: Hash28ByteBase16(blueprint.settingsSpend.hash),
+    },
+  });
+  const settings = await findSettings(provider, settingsAddress, blueprint.settingsSpend.hash);
+  let settingsDatumCbor = settings.output().datum()?.asInlineData()?.toCbor();
+  if (!settingsDatumCbor) {
+    throw new Error("Couldn't get settings datum");
+  }
+  return decodeSettingsDatum(decoder(fromHex(settingsDatumCbor)));
 }
 
 async function findPoolByIdent(provider: Provider, poolAddress: Core.Address, poolIdent: string): Promise<Core.TransactionUnspentOutput> {
@@ -2274,13 +2294,53 @@ interface PoolTodo {
   partial: boolean,
 }
 
-async function queryPools(provider: Provider, poolAddress: string, needed: bigint): Promise<PoolTodo> {
+// How much of an asset a pool utxo holds
+function poolHolds(utxo: Core.TransactionUnspentOutput, asset: AssetClass): bigint {
+  if (assetClassIsAda(asset)) {
+    return utxo.output().amount().coin();
+  }
+  return utxo.output().amount().multiasset()?.get(Core.AssetId(asset[0].toString("hex") + asset[1].toString("hex"))) ?? 0n;
+}
+
+// Whether a pool's datum claims more protocol fees than its utxo holds. Pool
+// creation doesn't bound the initial fees (CreatePool in pool.ak only checks
+// them against the creation fee), so anyone can make a pool like this, and a
+// withdrawal from it can't balance. fees are [flat ada, asset A, asset B].
+export function feesExceedHoldings(utxo: Core.TransactionUnspentOutput, assetPair: [AssetClass, AssetClass], fees: bigint[]): boolean {
+  let claimed = new Map<string, [AssetClass, bigint]>();
+  let claim = (asset: AssetClass, amount: bigint) => {
+    let key = asset[0].toString("hex") + asset[1].toString("hex");
+    claimed.set(key, [asset, (claimed.get(key)?.[1] ?? 0n) + amount]);
+  };
+  claim([Buffer.alloc(0), Buffer.alloc(0)], fees[0]);
+  if (fees.length > 1) {
+    claim(assetPair[0], fees[1]);
+    claim(assetPair[1], fees[2]);
+  }
+  return [...claimed.values()].some(([asset, amount]) => amount > poolHolds(utxo, asset));
+}
+
+// Pools the config says to leave alone, e.g. ones whose tokens we can't convert
+function skipped(skipPools: string[], identifier: Buffer): boolean {
+  if (skipPools.includes(identifier.toString("hex"))) {
+    console.log(`Skipping pool ${identifier.toString("hex")}, as configured`);
+    return true;
+  }
+  return false;
+}
+
+async function queryPools(provider: Provider, poolAddress: string, needed: bigint, skipPools: string[]): Promise<PoolTodo> {
   let poolUtxos = await provider.getUnspentOutputs(Core.addressFromBech32(poolAddress));
   let pools = [];
   for (let poolUtxo of poolUtxos) {
     try {
       let poolDatum = getPoolDatum(poolUtxo);
-      if (poolDatum) {
+      if (poolDatum && skipped(skipPools, poolDatum.identifier)) {
+        continue;
+      }
+      if (poolDatum && feesExceedHoldings(poolUtxo, poolDatum.assetPair, [poolDatum.protocolFees])) {
+        console.log(`Skipping pool ${poolDatum.identifier.toString("hex")}: its datum claims ${poolDatum.protocolFees} lovelace of fees, more than the pool holds`);
+      } else if (poolDatum) {
         if (poolDatum.circulatingLp != 0n) {
           pools.push({
             utxo: poolUtxo,
@@ -2327,19 +2387,40 @@ async function queryPools(provider: Provider, poolAddress: string, needed: bigin
   return todo;
 }
 
-async function queryStablePools(provider: Provider, poolAddress: string): Promise<PoolTodo> {
+// The tokens a stable withdrawal would pay out, as asset ids, so the run can
+// check it knows how to convert each of them before withdrawing anything
+export async function stableWithdrawalTokens(provider: Provider, poolAddress: string, skipPools: string[]): Promise<string[]> {
+  let tokens = new Set<string>();
+  for (let todo of await queryStablePools(provider, poolAddress, skipPools)) {
+    let [a, b] = todo.pool.assetPair;
+    for (let [asset, amount] of [[a, todo.amountA], [b, todo.amountB]] as [AssetClass, bigint][]) {
+      if (amount > 0n && !assetClassIsAda(asset)) {
+        tokens.add(asset[0].toString("hex") + asset[1].toString("hex"));
+      }
+    }
+  }
+  return [...tokens];
+}
+
+async function queryStablePools(provider: Provider, poolAddress: string, skipPools: string[]): Promise<PoolTodo> {
   let poolUtxos = await provider.getUnspentOutputs(Core.addressFromBech32(poolAddress));
   let pools = [];
   for (let poolUtxo of poolUtxos) {
     try {
       let poolDatum = getStablePoolDatum(poolUtxo);
-      if (poolDatum) {
+      if (poolDatum && skipped(skipPools, poolDatum.identifier)) {
+        continue;
+      }
+      if (poolDatum && feesExceedHoldings(poolUtxo, poolDatum.assetPair, poolDatum.protocolFees)) {
+        console.log(`Skipping stable pool ${poolDatum.identifier.toString("hex")}: its datum claims fees of ${poolDatum.protocolFees.join(", ")}, more than the pool holds`);
+      } else if (poolDatum) {
         if (poolDatum.circulatingLp != 0n) {
           pools.push({
             utxo: poolUtxo,
             txHash: poolUtxo.input().transactionId(),
             protocolFees: poolDatum.protocolFees,
             ident: poolDatum.identifier,
+            assetPair: poolDatum.assetPair,
           });
         }
       }
@@ -2553,6 +2634,50 @@ class ExtendedKeyWallet extends ColdWallet {
   }
 }
 
+// Spends from and balances against the funding wallet, and adds the treasury
+// admin's signature to transactions that require it (the pool withdrawals).
+// Keeping the run's funds apart from the admin's address means the run never
+// spends the admin's utxos; on preview those include a reference script that
+// Blockfrost's listings don't report, so it looks like plain ada. The admin
+// only signs when required, since Blaze sizes the fee for the witnesses the
+// transaction needs.
+export class AdminSigningWallet implements Wallet {
+  private constructor(
+    private funding: Wallet,
+    private adminKey: Core.Ed25519PrivateKey,
+    private adminPublicKey: Core.Ed25519PublicKey,
+    private adminKeyHash: string,
+  ) {}
+
+  static async create(funding: Wallet, adminKey: Core.Ed25519PrivateKey): Promise<AdminSigningWallet> {
+    await Core.initCrypto();
+    let adminPublicKey = await adminKey.toPublic();
+    return new AdminSigningWallet(funding, adminKey, adminPublicKey, (await adminPublicKey.hash()).hex());
+  }
+
+  async signTransaction(tx: Core.Transaction, partialSign: boolean): Promise<Core.TransactionWitnessSet> {
+    let witnesses = await this.funding.signTransaction(tx, partialSign);
+    let required: string[] = tx.body().requiredSigners()?.toCore() ?? [];
+    if (required.includes(this.adminKeyHash)) {
+      let signature = await this.adminKey.sign(HexBlob(tx.getId()));
+      let vkeys = witnesses.vkeys()?.toCore() ?? [];
+      witnesses.setVkeys(CborSet.fromCore([...vkeys, new VkeyWitness(this.adminPublicKey.hex(), signature.hex()).toCore()], VkeyWitness.fromCore));
+    }
+    return witnesses;
+  }
+
+  getNetworkId() { return this.funding.getNetworkId(); }
+  getUnspentOutputs() { return this.funding.getUnspentOutputs(); }
+  getBalance() { return this.funding.getBalance(); }
+  getUsedAddresses() { return this.funding.getUsedAddresses(); }
+  getUnusedAddresses() { return this.funding.getUnusedAddresses(); }
+  getChangeAddress() { return this.funding.getChangeAddress(); }
+  getRewardAddresses() { return this.funding.getRewardAddresses(); }
+  signData(address: Core.Address, payload: string) { return this.funding.signData(address, payload); }
+  postTransaction(tx: Core.Transaction) { return this.funding.postTransaction(tx); }
+  getCollateral() { return this.funding.getCollateral(); }
+}
+
 export async function setupBlaze(args: any): Promise<{ blaze: Blaze<Provider, Wallet>, provider: Provider }> {
   let isMainnet = args.mainnet || false;
   let skeyFilePath = args.skeyFile;
@@ -2593,6 +2718,11 @@ export async function setupBlaze(args: any): Promise<{ blaze: Blaze<Provider, Wa
   } else {
     wallet = new ColdWallet(Core.addressFromBech32(args.walletAddress), network, provider);
   }
+  // When the treasury admin isn't the wallet
+  if (args.adminSkeyFile) {
+    let admin = readSigningKeyFile(args.adminSkeyFile);
+    wallet = await AdminSigningWallet.create(wallet, admin.kind == "normal" ? Core.Ed25519PrivateKey.fromNormalHex(Core.Ed25519PrivateNormalKeyHex(admin.hex)) : admin.key);
+  }
 
   let blaze = await Blaze.from(provider, wallet);
 
@@ -2618,6 +2748,8 @@ interface AutoWithdrawOptions {
   txLogDir: string,
   todo: { pools: PoolTodo[], change: Core.TransactionUnspentOutput[] } | undefined,
   stable: boolean | undefined,
+  // Idents of pools not to withdraw from
+  skipPools: string[],
 }
 
 // A references file is a JSON list of { txHash, index } pointing at the utxos
@@ -2669,6 +2801,8 @@ export async function makeAutoWithdrawOptions(argv: any, blaze: Blaze<Provider, 
     txLogDir: argv.txLogDir,
     stable: argv.stable,
     todo: undefined,
+    // A list from a config, or comma separated on the command line
+    skipPools: typeof argv.skipPools == "string" ? argv.skipPools.split(",") : (argv.skipPools ?? []),
   }
 }
 
@@ -3446,9 +3580,9 @@ export async function autoWithdrawRewards(options: AutoWithdrawOptions): Promise
     change = options.todo.change;
   } else {
     if (options.stable) {
-      todo = await queryStablePools(options.provider, options.poolAddress);
+      todo = await queryStablePools(options.provider, options.poolAddress, options.skipPools);
     } else {
-      todo = await queryPools(options.provider, options.poolAddress, options.needed);
+      todo = await queryPools(options.provider, options.poolAddress, options.needed, options.skipPools);
     }
     change = await findChangeMany(options.provider, options.walletAddress, 7_000_000n, BigInt(todo.length));
   }
@@ -3710,6 +3844,23 @@ async function buildSwap(options: BuildSwapOptions) {
     tx.addInput(change);
   }
 
+  addSwapOrder(tx, options);
+
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+
+  return tx;
+}
+
+// Adds an order output to a transaction. The transaction's inputs must cover
+// the offer and the order's rider and fee.
+function addSwapOrder(tx: TxBuilder, options: Omit<BuildSwapOptions, "blaze" | "changeUtxos">) {
   let swapType = { type: ESwapType.MARKET, slippage: 0.03 };
   let offeredAsset = options.offeredAsset;
   if (offeredAsset != options.pool.assetA.assetId && offeredAsset != options.pool.assetB.assetId) {
@@ -3770,17 +3921,6 @@ async function buildSwap(options: BuildSwapOptions) {
     lockedValue,
     orderDatum,
   );
-
-  tx.useCoinSelector((inputs, dearth) => {
-    return {
-      selectedInputs: [],
-      selectedValue: new Value(0n),
-      inputs: [],
-      leftoverInputs: [],
-    }
-  });
-
-  return tx;
 }
 
 // Replace the destination datum of a V3 order datum with an inline datum.
@@ -3879,12 +4019,25 @@ async function filterDust(queryProvider, preferredPools, assetsToConvert, minRet
   return filtered;
 }
 
+// Builds one transaction with an order per asset. A wallet utxo can hold
+// several of the assets (a stable pool withdrawal pays out both of the pool's
+// tokens), so separate transactions per asset would compete for the same
+// utxos. adaChange covers each order's rider and fee.
 async function buildAssetSwaps(blaze, provider, wallet, queryProvider, preferredPools, assetsToConvert, adaChange, orderScriptAddresses: Map<EContractVersion, Core.Address>, settledOrders: Set<string>) {
-  let i = 0;
   let identifiers = new Set<string>();
-  let txs = [];
-  // Native asset change utxos already claimed by a swap in this batch
-  let usedUtxos = new Set<string>(adaChange.map(txref));
+  const tx = blaze.newTransaction();
+  // Utxos spent so far, and how much of each asset they hold
+  let usedUtxos = new Set<string>();
+  let held = new Multiasset();
+  let spend = (utxo: Core.TransactionUnspentOutput) => {
+    tx.addInput(utxo);
+    usedUtxos.add(txref(utxo));
+    for (let [asset, quantity] of utxo.output().amount().multiasset() ?? []) {
+      held.addAsset(asset, quantity);
+    }
+  };
+  adaChange.forEach(spend);
+
   for (let [asset, amount] of Object.entries(assetsToConvert)) {
     // Doesn't make sense to convert ADA to ADA
     if (asset == "" || asset == "ada.lovelace") {
@@ -3895,7 +4048,6 @@ async function buildAssetSwaps(blaze, provider, wallet, queryProvider, preferred
     if (!preferredPools[asset]) {
       throw new Error(`No preferred pools entry was provided for this asset (${asset})`);
     }
-    console.log(`${preferredPools[asset].pool}`);
     let pool = await queryProvider.findPoolDataByIdent(
       { ident: preferredPools[asset].pool }
     );
@@ -3905,51 +4057,41 @@ async function buildAssetSwaps(blaze, provider, wallet, queryProvider, preferred
     if (!SUPPORTED_SWAP_VERSIONS.includes(pool.version)) {
       throw new Error(`Preferred pool ${pool.ident} for ${asset} is a ${pool.version} pool; only ${SUPPORTED_SWAP_VERSIONS.join(" and ")} pools are supported`);
     }
-    console.log(`${stringify(pool)}`);
+    console.log(`Swapping ${amount} of ${asset} in pool ${pool.ident}`);
 
-    // The ada change utxos are disjoint from the native asset change utxos
-    // because findChangeMany excludes utxos with native assets, while
-    // collectChangeMa only includes utxos having the desired asset.
-    // However, calling collectChangeMa for asset X may choose utxos with
-    // extraneous native assets, which may include asset Y that we also want to
-    // convert.
-    // The solution is to only collect native asset change utxos that contain
-    // only the native asset and ada. This is disjoint per asset and also
-    // disjoint from the pure adaChange set.
-    let uniqueAdaChange = adaChange[i];
+    // The utxos spent for earlier assets may already hold enough of this one
+    let missing = BigInt(amount) - held.get(asset);
+    if (missing > 0n) {
+      (await collectChangeSingleAsset(provider, wallet, asset, missing, usedUtxos, settledOrders)).forEach(spend);
+    }
 
-    let nativeAssetChange = await collectChangeSingleAsset(provider, wallet, asset, BigInt(amount), usedUtxos, settledOrders);
-
-    console.log(`ASSET: ${asset}`);
-
-    // A unique identifier for this order. The ada change utxos may share a
-    // transaction id (e.g. if they came from the same fanout), so use random
-    // bytes instead.
+    // A unique identifier for this order, which its payout carries
     let identifier = new Uint8Array(randomTxId());
-
     identifiers.add(identifier.toHex());
 
-    let tx = await buildSwap({
-      blaze: blaze,
+    addSwapOrder(tx, {
       pool: pool,
-      changeUtxos: [uniqueAdaChange, ...nativeAssetChange],
       offeredAsset: toDot(asset),
       walletAddress: wallet,
       swapOfferAmount: BigInt(amount),
       orderScriptAddress: orderScriptAddresses.get(pool.version)!,
       identifier,
     });
-
-    console.log(`tx: ${tx.toCbor()}`);
-    let completed = await tx.complete();
-    console.log(`tx completed: ${completed.toCbor()}`);
-    txs.push(completed);
-
-    i++;
   }
 
+  tx.useCoinSelector((inputs, dearth) => {
+    return {
+      selectedInputs: [],
+      selectedValue: new Value(0n),
+      inputs: [],
+      leftoverInputs: [],
+    }
+  });
+  let completed = await tx.complete();
+  console.log(`tx completed: ${completed.toCbor()}`);
+
   return {
-    txs,
+    txs: [completed],
     identifiers
   };
 }

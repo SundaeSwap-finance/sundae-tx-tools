@@ -11,6 +11,8 @@ interface SundaeProtocolConfig {
   poolAddress?: string,
   references?: string,
   blueprint?: string,
+  // Idents of pools the withdrawals leave alone
+  skipPools?: string[],
 }
 
 export interface NetworkConfig {
@@ -38,7 +40,7 @@ const KEYS = [
   "genericStakeAddress", "poolStakeAddress", "preferredPoolsFile", "scooperAddressesFile",
   "delegatedScoopersFile", "tokenHoldersDestination", "yieldFarmingDestination", "txLogDir",
 ];
-const PROTOCOL_KEYS = ["poolAddress", "references", "blueprint"];
+const PROTOCOL_KEYS = ["poolAddress", "references", "blueprint", "skipPools"];
 
 export function readConfig(file: string): NetworkConfig {
   let config = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -103,6 +105,7 @@ export function applyConfig(argv: Record<string, any>, config: NetworkConfig): R
   if (argv.autoWithdrawRewards) {
     defaults.poolAddress = protocol?.poolAddress;
     defaults.references = protocol?.references;
+    defaults.skipPools = protocol?.skipPools;
   }
   if (argv.withdrawGenericStake) {
     defaults.stakeAddress = config.genericStakeAddress;

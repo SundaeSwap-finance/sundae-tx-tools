@@ -113,6 +113,31 @@ describe("convertAssetsToAda", () => {
     expect(walletBalance(world, STABLE_TOKEN)).toBe(0n);
   });
 
+  it("swaps tokens that share utxos, as a stable pool withdrawal pays them", async () => {
+    // A second token with its own ada pool, at 1 ADA per token
+    const PAIRED_TOKEN = Core.AssetId("ef".repeat(28) + "5041495244"); // "PAIRD"
+    let pairedPool = makePoolData(ident(), "", PAIRED_TOKEN, 1_000_000_000n, 1_000_000_000n);
+    market.query.addPool(pairedPool);
+    market.preferredPools[PAIRED_TOKEN] = { pool: pairedPool.ident };
+    // Each withdrawal pays out both of its pool's tokens together
+    for (let [stable, paired] of [[1_000_000n, 2_000_000n], [3_000_000n, 4_000_000n]]) {
+      let output = new Core.TransactionOutput(world.wallet, new Core.Value(2_000_000n, new Map([
+        [Core.AssetId(STABLE_TOKEN), stable],
+        [PAIRED_TOKEN, paired],
+      ])));
+      let input = new Core.TransactionInput(Core.TransactionId(crypto.randomBytes(32).toString("hex")), 0n);
+      world.emulator.addUtxo(new Core.TransactionUnspentOutput(input, output));
+    }
+
+    await runConvert(world, market, { [STABLE_TOKEN]: "4000000", [PAIRED_TOKEN]: "6000000" });
+
+    // One transaction carries both orders, and both are filled
+    expect(world.provider.submissions.length).toBe(1);
+    expect(market.scooper.filled.length).toBe(2);
+    expect(walletBalance(world, STABLE_TOKEN)).toBe(0n);
+    expect(walletBalance(world, PAIRED_TOKEN)).toBe(0n);
+  });
+
   it("swaps a token without an ada pool in two rounds", async () => {
     fund(world, OTHER_TOKEN, 3_000_000n);
     let earned = await runConvert(world, market, { [OTHER_TOKEN]: "3000000" });

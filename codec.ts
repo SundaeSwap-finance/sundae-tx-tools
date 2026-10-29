@@ -338,12 +338,12 @@ export function decodeSettingsDatum(d: Decoder): SettingsDatum {
   let simpleFee = decodeInteger(d);
   let strategyFee = decodeInteger(d);
   let poolCreationFee = decodeInteger(d);
-  // We don't care about the extensions; we could just skip it but it's actually
-  // kind of annoying to implement a "skip the next CBOR item" function to
-  // handle the extensions. Fortunately we can just return immediately since
-  // this is the last item in the datum
-  //let extensions = decodeData(d);
-  //decodeBreak(d);
+  // Rather than decode the extensions, keep their raw CBOR, so a datum
+  // re-encodes unchanged. They're the last item, so they run up to the break
+  // that ends the datum's (indefinite) field list.
+  let extensions = d.bytes.length > d.ptr && d.bytes[d.bytes.length - 1] == 0xff
+    ? d.bytes.subarray(d.ptr, d.bytes.length - 1)
+    : undefined;
   return {
     settingsAdmin,
     metadataAdmin,
@@ -356,7 +356,7 @@ export function decodeSettingsDatum(d: Decoder): SettingsDatum {
     simpleFee,
     strategyFee,
     poolCreationFee,
-    //extensions,
+    extensions,
   };
 }
 

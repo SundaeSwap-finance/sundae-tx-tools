@@ -124,8 +124,8 @@ async function makeMonth(): Promise<Month> {
     walletAddress: wallet,
     signers: pkh.hex(),
     sundaeAssetId: SUNDAE,
-    v3: { poolAddress: v3PoolAddress!.toBech32(), references: v3References.map((r) => r.input()), blueprint },
-    stable: { poolAddress: stablePoolAddress(pkh.hex()).toBech32(), references: stableReferences.map((r) => r.input()), blueprint: stableBlueprint },
+    v3: { poolAddress: v3PoolAddress!.toBech32(), references: v3References.map((r) => r.input()), blueprint, skipPools: [] },
+    stable: { poolAddress: stablePoolAddress(pkh.hex()).toBech32(), references: stableReferences.map((r) => r.input()), blueprint: stableBlueprint, skipPools: [] },
     genericStakeAddress,
     poolStakeAddress,
     preferredPools: { [STABLE_TOKEN]: { pool: stablePool.ident }, [SUNDAE]: { pool: sundaePool.ident } },
@@ -149,13 +149,15 @@ async function makeMonth(): Promise<Month> {
       write: async (record) => { saved = structuredClone(record); },
     },
     txLogDir: "",
+    allowPartialAllowance: false,
   };
   return { emulator, provider, ctx, scooper, stakeKey, record: () => saved };
 }
 
 // The co-signer adds the stake key's witness, the wallet adds its own, and the
 // co-signer submits
-async function coSign(month: Month, tx: Transaction) {
+async function coSign(month: Month, tx: Transaction | undefined) {
+  tx = tx!;
   await month.ctx.blaze.signTransaction(tx);
   let witnesses = tx.witnessSet();
   let stakeWitness = new VkeyWitness((await month.stakeKey.toPublic()).hex(), signMessage(HexBlob(tx.getId()), month.stakeKey.hex()));
@@ -207,10 +209,10 @@ describe("the monthly revenue run", () => {
     // The report counts what was withdrawn, less the pool stake's 2 ADA to the
     // treasury
     expect(report.rewards).toEqual({
-      [month.ctx.genericStakeAddress]: Number(GENERIC_REWARDS),
+      [month.ctx.genericStakeAddress!]: Number(GENERIC_REWARDS),
       [month.ctx.poolStakeAddress]: Number(POOL_STAKE_REWARDS - 2_000_000n),
     });
-    expect(month.emulator.accounts.get(month.ctx.genericStakeAddress)).toBe(0n);
+    expect(month.emulator.accounts.get(month.ctx.genericStakeAddress!)).toBe(0n);
     expect(month.emulator.accounts.get(month.ctx.poolStakeAddress)).toBe(0n);
     expect(report.extraStableswapRevenue).toBe(Number(record.conversion!.ada));
     expect(report.extraStableswapRevenue).toBeGreaterThan(0);
@@ -273,7 +275,7 @@ describe("the monthly revenue run", () => {
     await coSign(month, await rebuildGenericStakeWithdrawal(month.ctx));
     await runStage2(month.ctx, () => CSV);
     let report = JSON.parse(month.record()!.report!);
-    expect(report.rewards[month.ctx.genericStakeAddress]).toBe(Number(GENERIC_REWARDS + 5_000_000n));
+    expect(report.rewards[month.ctx.genericStakeAddress!]).toBe(Number(GENERIC_REWARDS + 5_000_000n));
   });
 
   it("won't rebuild a generic stake withdrawal that landed", async () => {
@@ -288,6 +290,56 @@ describe("the monthly revenue run", () => {
     month.scooper.delayScoops = 100;
     await expect(runStage1(month.ctx, "2026-10")).rejects.toThrow(/settled/);
     await expect(runStage2(month.ctx, () => CSV)).rejects.toThrow(/missing conversion, poolStakeWithdrawal, genericStakeWithdrawal/);
+  });
+
+  it("goes straight from stage 1 to stage 2 with no generic stake address", async () => {
+    month.ctx.genericStakeAddress = undefined;
+    expect(await runStage1(month.ctx, "2026-10")).toBeUndefined();
+    await runStage2(month.ctx, () => CSV);
+
+    let record = month.record()!;
+    expect(record.genericStakeWithdrawal).toBeUndefined();
+    expect(record.genericStakeConfirmed).toBeUndefined();
+    expect(JSON.parse(record.report!).rewards).toEqual({
+      [month.ctx.poolStakeAddress]: Number(POOL_STAKE_REWARDS - 2_000_000n),
+    });
+    await expect(rebuildGenericStakeWithdrawal(month.ctx)).rejects.toThrow(/no generic stake address/);
+  });
+
+  it("won't withdraw stable pool fees it has no pool to convert", async () => {
+    delete month.ctx.preferredPools[STABLE_TOKEN];
+    await expect(runStage1(month.ctx, "2026-10")).rejects.toThrow(/No preferred pool to convert (ab)+7553444d/);
+    // Only the change was made
+    expect(month.provider.submissions.length).toBe(1);
+    expect(month.record()!.stableWithdrawal).toBeUndefined();
+  });
+
+  it("won't run with a treasury allowance under 1/1", async () => {
+    setTreasuryAllowance(month.emulator, 1n, 10n);
+    await expect(runStage1(month.ctx, "2026-10")).rejects.toThrow(/treasury allowance is 1\/10/);
+    expect(month.provider.submissions.length).toBe(0);
+
+    // Nor carry on into stage 2 if the allowance changes between stages
+    setTreasuryAllowance(month.emulator, 1n, 1n);
+    await coSign(month, await runStage1(month.ctx, "2026-10"));
+    let submitted = month.provider.submissions.length;
+    setTreasuryAllowance(month.emulator, 1n, 10n);
+    await expect(runStage2(month.ctx, () => CSV)).rejects.toThrow(/treasury allowance is 1\/10/);
+    expect(month.provider.submissions.length).toBe(submitted);
+  });
+
+  it("runs at a partial allowance when told to, paying out only what reached the wallet", async () => {
+    setTreasuryAllowance(month.emulator, 1n, 10n);
+    month.ctx.allowPartialAllowance = true;
+    await runMonth(month);
+
+    let record = month.record()!;
+    expect(record.payout).toBeDefined();
+    // The treasury took most of the pool stake rewards, and the report counts
+    // the rest
+    let report = JSON.parse(record.report!);
+    expect(BigInt(report.rewards[month.ctx.poolStakeAddress])).toBe(BigInt(record.poolStakeWithdrawal!.withheld));
+    expect(BigInt(record.poolStakeWithdrawal!.withheld)).toBeLessThan(POOL_STAKE_REWARDS / 5n);
   });
 
   it("won't continue another month's run", async () => {

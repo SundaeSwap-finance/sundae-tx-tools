@@ -14,6 +14,16 @@
 // that fails can be rerun to pick up where it left off, and rerunning a
 // finished stage does nothing. A step that fails partway through itself (say,
 // after the first of several withdrawals) needs looking at by hand.
+//
+// A network with no generic stake address (preview) skips the co-signed
+// withdrawal, so stage 2 can follow stage 1 straight away.
+//
+// The pipeline needs a treasury allowance of 1/1, as on mainnet. Everything a
+// withdrawal takes is revenue to pay out, but the payout can only spend what
+// reaches the wallet; with a smaller allowance, most of it would go to the
+// treasury instead. allowPartialAllowance lets a test run (preview is at 1/10)
+// carry on anyway: the report then counts only what reached the wallet, and
+// the wallet's own funds make up most of the v3 protocol fees.
 import * as fs from "node:fs";
 import minimist from "minimist";
 import { Core } from "@blaze-cardano/sdk";
@@ -38,7 +48,9 @@ import {
   payout,
   payoutChangeNeeded,
   readReferences,
+  readSettingsDatum,
   setupBlaze,
+  stableWithdrawalTokens,
   withdrawGenericStake,
   withdrawPoolStakeRewards,
   type Blueprint,
@@ -67,7 +79,10 @@ export interface RunRecord {
   payout?: { txId: string },
 }
 
-const STAGE_1_STEPS = ["makeChange", "stableWithdrawal", "conversion", "poolStakeWithdrawal", "genericStakeWithdrawal"] as const;
+function stage1Steps(ctx: PipelineContext): (keyof RunRecord)[] {
+  let steps: (keyof RunRecord)[] = ["makeChange", "stableWithdrawal", "conversion", "poolStakeWithdrawal"];
+  return ctx.genericStakeAddress ? [...steps, "genericStakeWithdrawal"] : steps;
+}
 
 // Where a month's run record lives: a file locally, S3 in a Lambda
 export interface RunStore {
@@ -86,6 +101,7 @@ interface ProtocolContext {
   poolAddress: string,
   references: Core.TransactionInput[],
   blueprint: Blueprint,
+  skipPools: string[],
 }
 
 export interface PipelineContext {
@@ -98,7 +114,7 @@ export interface PipelineContext {
   sundaeAssetId: string,
   v3: ProtocolContext,
   stable: ProtocolContext,
-  genericStakeAddress: Core.RewardAccount,
+  genericStakeAddress: Core.RewardAccount | undefined,
   poolStakeAddress: Core.RewardAccount,
   preferredPools: Record<string, { pool: string }>,
   // As in scooper-addresses.json and delegated-scoopers.json
@@ -113,10 +129,23 @@ export interface PipelineContext {
   orders: { confirmationTimeoutMs: number, pollIntervalMs: number, maxPolls: number, sleep: (ms: number) => Promise<void> },
   store: RunStore,
   txLogDir: string,
+  // Run even though the treasury allowance isn't 1/1 (for test runs)
+  allowPartialAllowance: boolean,
 }
 
 // Runs a step unless the record already has its result, and saves the result
 // as soon as it's done
+async function checkFullAllowance(ctx: PipelineContext) {
+  let { numerator, denominator } = (await readSettingsDatum(ctx.provider, ctx.v3.blueprint)).treasuryAllowance;
+  if (numerator != denominator) {
+    let problem = `The treasury allowance is ${numerator}/${denominator}; the pipeline only supports 1/1, where what's withdrawn reaches the wallet to be paid out`;
+    if (!ctx.allowPartialAllowance) {
+      throw new Error(problem);
+    }
+    console.warn(`Warning: ${problem}. Carrying on, as --allowPartialAllowance was given: the report will count only what reaches the wallet, and the wallet will make up most of the v3 protocol fees.`);
+  }
+}
+
 async function step<K extends keyof RunRecord>(ctx: PipelineContext, record: RunRecord, name: K, run: () => Promise<NonNullable<RunRecord[K]>>): Promise<NonNullable<RunRecord[K]>> {
   let done = record[name];
   if (done !== undefined) {
@@ -135,12 +164,13 @@ function json(value: { toJSON(): string }): Record<string, string> {
 }
 
 // Stage 1. Returns the generic stake withdrawal for the co-signer to sign and
-// submit.
-export async function runStage1(ctx: PipelineContext, month: string): Promise<Core.Transaction> {
+// submit, if there is one.
+export async function runStage1(ctx: PipelineContext, month: string): Promise<Core.Transaction | undefined> {
   let record = await ctx.store.read() ?? { month };
   if (record.month != month) {
     throw new Error(`The run record is for ${record.month}, not ${month}`);
   }
+  await checkFullAllowance(ctx);
   let withdrawalOptions = {
     blaze: ctx.blaze,
     provider: ctx.provider,
@@ -175,6 +205,12 @@ export async function runStage1(ctx: PipelineContext, month: string): Promise<Co
   });
 
   let stable = await step(ctx, record, "stableWithdrawal", async () => {
+    // The conversion needs a pool for every token, and it's too late to find
+    // that out once they're withdrawn
+    let unconvertible = (await stableWithdrawalTokens(ctx.provider, ctx.stable.poolAddress, ctx.stable.skipPools)).filter((token) => !ctx.preferredPools[token]);
+    if (unconvertible.length > 0) {
+      throw new Error(`No preferred pool to convert ${unconvertible.join(", ")} to ada; add one before withdrawing the stable pool fees`);
+    }
     let { withheld } = await autoWithdrawRewards({
       ...withdrawalOptions,
       poolAddress: ctx.stable.poolAddress,
@@ -182,6 +218,7 @@ export async function runStage1(ctx: PipelineContext, month: string): Promise<Co
       blueprint: ctx.v3.blueprint,
       stableBlueprint: ctx.stable.blueprint,
       references: ctx.stable.references,
+      skipPools: ctx.stable.skipPools,
       stable: true,
     });
     return { withheld: json(withheld) };
@@ -202,16 +239,19 @@ export async function runStage1(ctx: PipelineContext, month: string): Promise<Co
     return { txId: tx.getId(), withdrawn: withdrawn.toString(), withheld: withheld.toString() };
   });
 
-  let generic = await step(ctx, record, "genericStakeWithdrawal", () => buildGenericStakeWithdrawal(ctx));
+  if (!ctx.genericStakeAddress) {
+    return undefined;
+  }
+  let generic = await step(ctx, record, "genericStakeWithdrawal", () => buildGenericStakeWithdrawal(ctx, ctx.genericStakeAddress!));
   return Core.Transaction.fromCbor(Core.TxCBOR(generic.tx));
 }
 
-async function buildGenericStakeWithdrawal(ctx: PipelineContext): Promise<NonNullable<RunRecord["genericStakeWithdrawal"]>> {
+async function buildGenericStakeWithdrawal(ctx: PipelineContext, stakeAddress: Core.RewardAccount): Promise<NonNullable<RunRecord["genericStakeWithdrawal"]>> {
   let { tx, withdrawn } = await withdrawGenericStake({
     blaze: ctx.blaze,
     provider: ctx.provider,
     walletAddress: ctx.walletAddress,
-    stakeAddress: ctx.genericStakeAddress,
+    stakeAddress,
     rewardBalance: ctx.rewardBalance,
     // Built for the co-signer, who has the stake key
     stakeKey: undefined,
@@ -224,6 +264,9 @@ async function buildGenericStakeWithdrawal(ctx: PipelineContext): Promise<NonNul
 // Replaces a generic stake withdrawal that can no longer land, e.g. because an
 // epoch passed before the co-signer submitted it, so the balance changed
 export async function rebuildGenericStakeWithdrawal(ctx: PipelineContext): Promise<Core.Transaction> {
+  if (!ctx.genericStakeAddress) {
+    throw new Error("There's no generic stake address in the config");
+  }
   let record = await ctx.store.read();
   if (!record?.genericStakeWithdrawal) {
     throw new Error("Stage 1 hasn't built the generic stake withdrawal yet");
@@ -234,7 +277,7 @@ export async function rebuildGenericStakeWithdrawal(ctx: PipelineContext): Promi
   if (await ctx.provider.awaitTransactionConfirmation(Core.TransactionId(record.genericStakeWithdrawal.txId), 0)) {
     throw new Error(`The generic stake withdrawal ${record.genericStakeWithdrawal.txId} landed; run stage 2`);
   }
-  record.genericStakeWithdrawal = await buildGenericStakeWithdrawal(ctx);
+  record.genericStakeWithdrawal = await buildGenericStakeWithdrawal(ctx, ctx.genericStakeAddress);
   await ctx.store.write(record);
   return Core.Transaction.fromCbor(Core.TxCBOR(record.genericStakeWithdrawal.tx));
 }
@@ -244,18 +287,21 @@ export async function rebuildGenericStakeWithdrawal(ctx: PipelineContext): Promi
 // the payout's transaction id.
 export async function runStage2(ctx: PipelineContext, scooperCsv: (() => string) | undefined): Promise<string> {
   let record = await ctx.store.read();
-  let missing = STAGE_1_STEPS.filter((name) => !record?.[name]);
+  let missing = stage1Steps(ctx).filter((name) => !record?.[name]);
   if (!record || missing.length > 0) {
     throw new Error(`Stage 1 isn't finished (missing ${missing.join(", ")})`);
   }
-  let generic = record.genericStakeWithdrawal!;
+  await checkFullAllowance(ctx);
+  let generic = record.genericStakeWithdrawal;
 
-  await step(ctx, record, "genericStakeConfirmed", async () => {
-    if (!(await ctx.provider.awaitTransactionConfirmation(Core.TransactionId(generic.txId), ctx.retry.confirmationTimeoutMs))) {
-      throw new Error(`The generic stake withdrawal ${generic.txId} isn't confirmed. If the co-signer has yet to submit it, run stage 2 again once they have; if it can no longer land (e.g. an epoch passed), rebuild it.`);
-    }
-    return { txId: generic.txId };
-  });
+  if (ctx.genericStakeAddress) {
+    await step(ctx, record, "genericStakeConfirmed", async () => {
+      if (!(await ctx.provider.awaitTransactionConfirmation(Core.TransactionId(generic!.txId), ctx.retry.confirmationTimeoutMs))) {
+        throw new Error(`The generic stake withdrawal ${generic!.txId} isn't confirmed. If the co-signer has yet to submit it, run stage 2 again once they have; if it can no longer land (e.g. an epoch passed), rebuild it.`);
+      }
+      return { txId: generic!.txId };
+    });
+  }
 
   let reportJson = await step(ctx, record, "report", async () => {
     if (!scooperCsv) {
@@ -268,7 +314,7 @@ export async function runStage2(ctx: PipelineContext, scooperCsv: (() => string)
       delegatedScoopers: ctx.delegatedScoopers.delegatedScoopers,
       // What reached the wallet
       stakingRewards: {
-        [ctx.genericStakeAddress]: BigInt(generic.withdrawn),
+        ...(ctx.genericStakeAddress ? { [ctx.genericStakeAddress]: BigInt(generic!.withdrawn) } : {}),
         [ctx.poolStakeAddress]: BigInt(record.poolStakeWithdrawal!.withheld),
       },
       extraStableswapRevenue: BigInt(record.conversion!.ada),
@@ -298,6 +344,7 @@ export async function runStage2(ctx: PipelineContext, scooperCsv: (() => string)
       blueprint: ctx.v3.blueprint,
       stableBlueprint: undefined,
       references: ctx.v3.references,
+      skipPools: ctx.v3.skipPools,
       stable: false,
     });
     return { withheld: json(withheld) };
@@ -363,7 +410,7 @@ export async function cliContext(argv: any, config: NetworkConfig, store: RunSto
     if (!p?.poolAddress || !p.references || !p.blueprint) {
       throw new Error(`The pipeline needs ${name}.poolAddress, ${name}.references and ${name}.blueprint in the config`);
     }
-    return { poolAddress: p.poolAddress, references: readReferences(p.references), blueprint: decodeBlueprint(fs.readFileSync(p.blueprint, "utf8")) };
+    return { poolAddress: p.poolAddress, references: readReferences(p.references), blueprint: decodeBlueprint(fs.readFileSync(p.blueprint, "utf8")), skipPools: p.skipPools ?? [] };
   };
   let approve = await cliApprover(!!argv.forceSubmit);
   return {
@@ -375,7 +422,7 @@ export async function cliContext(argv: any, config: NetworkConfig, store: RunSto
     sundaeAssetId: configured("sundaeAssetId"),
     v3: protocol(config.v3, "v3"),
     stable: protocol(config.stable, "stable"),
-    genericStakeAddress: required(config.genericStakeAddress, "genericStakeAddress") as Core.RewardAccount,
+    genericStakeAddress: config.genericStakeAddress as Core.RewardAccount | undefined,
     poolStakeAddress: required(config.poolStakeAddress, "poolStakeAddress") as Core.RewardAccount,
     preferredPools: readJson(configured("preferredPoolsFile")),
     scooperAddressesJson: fs.readFileSync(configured("scooperAddresses"), "utf8"),
@@ -388,6 +435,7 @@ export async function cliContext(argv: any, config: NetworkConfig, store: RunSto
     orders: defaultConvertAssetsTiming,
     store,
     txLogDir: argv.txLogDir,
+    allowPartialAllowance: !!argv.allowPartialAllowance,
   };
 }
 
@@ -409,7 +457,11 @@ if (import.meta.main) {
     console.log(`Rebuilt the generic stake withdrawal for the co-signer: ${tx.toCbor()}`);
   } else if (argv.stage == 1) {
     let tx = await runStage1(ctx, month);
-    console.log(`Stage 1 done. Once the co-signer has signed and submitted the generic stake withdrawal, run stage 2: ${tx.toCbor()}`);
+    if (tx) {
+      console.log(`Stage 1 done. Once the co-signer has signed and submitted the generic stake withdrawal, run stage 2: ${tx.toCbor()}`);
+    } else {
+      console.log("Stage 1 done. There's no generic stake withdrawal, so run stage 2.");
+    }
   } else if (argv.stage == 2) {
     await runStage2(ctx, argv.scooperCsv ? () => fs.readFileSync(argv.scooperCsv, "utf8") : undefined);
   } else {
